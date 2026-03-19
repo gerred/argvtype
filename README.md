@@ -14,6 +14,14 @@ Bash has linters and formatters, but no correctness layer that understands *type
 
 These are the bugs that break production deploys, not the ones that break lint checks.
 
+## Agent-first design
+
+ArgvType is designed to work as a guardrail for AI agents that generate and execute shell commands. Agents using Bash tools (Claude Code, custom agent frameworks, CI pipelines) produce shell code without the muscle memory that keeps experienced developers out of trouble. ArgvType catches the mistakes before they execute.
+
+**Zero-annotation mode** is the primary agent use case. The checker infers types from native Bash constructs — `declare -a`, `[[ -f ]]`, `${x:?}`, assignment patterns — and ships a built-in command library with type signatures for coreutils, common devops tools, and Bash builtins. No `#@` pragmas needed. An agent piping commands through argvtype gets useful diagnostics out of the box.
+
+Annotations exist for human-authored code that wants stronger contracts. Agents don't write them; they benefit from the inference and the stdlib.
+
 ## Core idea
 
 Every variable in Bash has four properties that matter for correctness:
@@ -193,13 +201,13 @@ The checker surfaces precision loss rather than fabricating precision.
 
 **Exit: enforces typed path contracts across a sourced workspace.**
 
-### M3: Extern contracts and `.bti`
+### M3: Extern contracts, `.bti`, and command stdlib
 - `.bti` parser
-- Builtins + coreutils standard library
-- External command checking
-- `stubgen` prototype
+- Built-in command library: Bash builtins, coreutils, common devops tools (`git`, `docker`, `kubectl`, `jq`)
+- External command checking against stdlib signatures
+- `stubgen` prototype for generating `.bti` from new commands
 
-**Exit: type-checks orchestration scripts against command stubs.**
+**Exit: type-checks scripts against command stubs. Zero-annotation checking works out of the box.**
 
 ### M4: Agent hook integration
 - PreToolUse hook for Claude Code and agent frameworks
