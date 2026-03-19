@@ -153,15 +153,6 @@ argvtype/
 
 Five crates. Split when boundaries are proven, not before.
 
-## Implementation language
-
-**Rust**, edition **2024**. Chosen for:
-
-- tree-sitter bindings and LSP ecosystem
-- algebraic types for IR modeling
-- performance for incremental workspace analysis
-- mature testing, serialization, and diagnostic infrastructure
-
 ## Soundness boundaries
 
 ArgvType is honest about what it cannot know. These features widen to `Dyn` with a structured diagnostic:
@@ -210,15 +201,24 @@ The checker surfaces precision loss rather than fabricating precision.
 
 **Exit: type-checks orchestration scripts against command stubs.**
 
-### M4: LSP alpha
+### M4: Agent hook integration
+- PreToolUse hook for Claude Code and agent frameworks
+- Check Bash commands before execution, deny with diagnostics on type errors
+- PostToolUse hook to analyze failed command output
+- Ship hook scripts and configuration in the repo
+
+**Exit: argvtype runs as a guardrail on agent-generated shell commands.**
+
+### M5: LSP alpha
 - Diagnostics, hover, code actions
 - Cross-file source graph
+- Incremental analysis
 
 **Exit: usable in VS Code / Neovim.**
 
 ## Status
 
-**Pre-M0.** Workspace scaffolding in progress.
+**M0 complete.** Parser, HIR, basic checker, and CLI working.
 
 ## License
 
