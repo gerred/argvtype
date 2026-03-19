@@ -1,0 +1,16 @@
+[package]
+name = "argvtype-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "argvtype"
+path = "src/main.rs"
+
+[dependencies]
+argvtype-core = { workspace = true }
+argvtype-syntax = { workspace = true }
+argvtype-lsp = { workspace = true }
+clap = { workspace = true }
+miette = { workspace = true }
+serde_json = { workspace = true }

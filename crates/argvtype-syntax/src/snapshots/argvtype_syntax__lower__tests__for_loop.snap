@@ -1,0 +1,46 @@
+---
+source: crates/argvtype-syntax/src/lower.rs
+expression: result.source_unit
+---
+source_id: 0
+annotations: []
+items:
+  - Statement:
+      For:
+        id: 0
+        span:
+          start: 0
+          end: 34
+        variable: f
+        items:
+          - span:
+              start: 9
+              end: 14
+            segments:
+              - Literal: "*.txt"
+        body:
+          - Command:
+              id: 1
+              span:
+                start: 19
+                end: 28
+              name:
+                span:
+                  start: 19
+                  end: 23
+                segments:
+                  - Literal: echo
+              args:
+                - span:
+                    start: 24
+                    end: 28
+                  segments:
+                    - DoubleQuoted:
+                        - ParamExpand:
+                            span:
+                              start: 25
+                              end: 27
+                            name: f
+                            operator: ~
+                            operand: ~
+              redirects: []

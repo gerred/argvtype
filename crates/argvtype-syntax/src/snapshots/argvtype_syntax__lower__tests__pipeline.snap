@@ -1,0 +1,69 @@
+---
+source: crates/argvtype-syntax/src/lower.rs
+expression: result.source_unit
+---
+source_id: 0
+annotations: []
+items:
+  - Statement:
+      Pipeline:
+        id: 0
+        span:
+          start: 0
+          end: 31
+        commands:
+          - Command:
+              id: 1
+              span:
+                start: 0
+                end: 8
+              name:
+                span:
+                  start: 0
+                  end: 3
+                segments:
+                  - Literal: cat
+              args:
+                - span:
+                    start: 4
+                    end: 8
+                  segments:
+                    - Literal: file
+              redirects: []
+          - Command:
+              id: 2
+              span:
+                start: 11
+                end: 23
+              name:
+                span:
+                  start: 11
+                  end: 15
+                segments:
+                  - Literal: grep
+              args:
+                - span:
+                    start: 16
+                    end: 23
+                  segments:
+                    - Literal: pattern
+              redirects: []
+          - Command:
+              id: 3
+              span:
+                start: 26
+                end: 31
+              name:
+                span:
+                  start: 26
+                  end: 28
+                segments:
+                  - Literal: wc
+              args:
+                - span:
+                    start: 29
+                    end: 31
+                  segments:
+                    - Literal: "-l"
+              redirects: []
+        negated: false

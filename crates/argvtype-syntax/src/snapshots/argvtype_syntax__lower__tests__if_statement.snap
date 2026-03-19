@@ -1,0 +1,81 @@
+---
+source: crates/argvtype-syntax/src/lower.rs
+expression: result.source_unit
+---
+source_id: 0
+annotations: []
+items:
+  - Statement:
+      If:
+        id: 0
+        span:
+          start: 0
+          end: 47
+        condition:
+          - Command:
+              id: 1
+              span:
+                start: 3
+                end: 14
+              name:
+                span:
+                  start: 3
+                  end: 14
+                segments:
+                  - Literal: "[["
+              args:
+                - span:
+                    start: 6
+                    end: 8
+                  segments:
+                    - Literal: "-f"
+                - span:
+                    start: 9
+                    end: 11
+                  segments:
+                    - ParamExpand:
+                        span:
+                          start: 9
+                          end: 11
+                        name: x
+                        operator: ~
+                        operand: ~
+              redirects: []
+        then_body:
+          - Command:
+              id: 2
+              span:
+                start: 21
+                end: 29
+              name:
+                span:
+                  start: 21
+                  end: 25
+                segments:
+                  - Literal: echo
+              args:
+                - span:
+                    start: 26
+                    end: 29
+                  segments:
+                    - Literal: "yes"
+              redirects: []
+        else_body:
+          - Command:
+              id: 3
+              span:
+                start: 36
+                end: 43
+              name:
+                span:
+                  start: 36
+                  end: 40
+                segments:
+                  - Literal: echo
+              args:
+                - span:
+                    start: 41
+                    end: 43
+                  segments:
+                    - Literal: "no"
+              redirects: []

@@ -1,0 +1,8 @@
+[package]
+name = "argvtype-lsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argvtype-core = { workspace = true }
+thiserror = { workspace = true }

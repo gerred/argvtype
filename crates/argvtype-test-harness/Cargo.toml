@@ -1,0 +1,11 @@
+[package]
+name = "argvtype-test-harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argvtype-syntax = { workspace = true }
+argvtype-core = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
