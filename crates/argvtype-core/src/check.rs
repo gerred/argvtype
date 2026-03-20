@@ -1,33 +1,30 @@
 use argvtype_syntax::hir::*;
 use argvtype_syntax::span::SourceId;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Fix};
+use crate::scope::{self, CellKind, ScopeId, SymbolTable, ExpansionShape};
 use crate::stdlib::{self, Destructiveness};
 
 const BT000: DiagnosticCode = DiagnosticCode { family: "BT", number: 0 };
+const BT101: DiagnosticCode = DiagnosticCode { family: "BT", number: 101 };
 const BT201: DiagnosticCode = DiagnosticCode { family: "BT", number: 201 };
 const BT202: DiagnosticCode = DiagnosticCode { family: "BT", number: 202 };
 const BT801: DiagnosticCode = DiagnosticCode { family: "BT", number: 801 };
 const BT802: DiagnosticCode = DiagnosticCode { family: "BT", number: 802 };
 
 pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
+    let symbols = scope::build_symbol_table(source_unit);
     let mut diagnostics = Vec::new();
     let source_id = source_unit.source_id;
-
-    // Collect top-level array names
-    let mut top_array_names: Vec<String> = Vec::new();
-    for item in &source_unit.items {
-        if let Item::Statement(Statement::Assignment(a)) = item
-            && is_array_decl(a)
-        {
-            top_array_names.push(a.name.clone());
-        }
-    }
+    let root = symbols.root_scope();
 
     for item in &source_unit.items {
         match item {
-            Item::Function(f) => check_statements(&f.body, source_id, &mut diagnostics),
+            Item::Function(f) => {
+                let scope = symbols.scope_of_node(f.id).unwrap_or(root);
+                check_statements(&f.body, source_id, &symbols, scope, &mut diagnostics);
+            }
             Item::Statement(s) => {
-                check_statement_with_arrays(s, source_id, &top_array_names, &mut diagnostics);
+                check_statement(s, source_id, &symbols, root, &mut diagnostics);
             }
             _ => {}
         }
@@ -36,42 +33,43 @@ pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
     // BT802: check consecutive top-level items for cd;next pattern
     check_consecutive_cd_items(&source_unit.items, source_id, &mut diagnostics);
 
+    // BT101: annotation/declaration shape mismatches
+    check_type_mismatches(&symbols, source_id, &mut diagnostics);
+
     diagnostics
 }
 
-fn check_statements(stmts: &[Statement], source_id: SourceId, diagnostics: &mut Vec<Diagnostic>) {
-    // First pass: collect declared array names
-    let mut array_names: Vec<String> = Vec::new();
+fn check_statements(
+    stmts: &[Statement],
+    source_id: SourceId,
+    symbols: &SymbolTable,
+    scope: ScopeId,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     for stmt in stmts {
-        if let Statement::Assignment(a) = stmt
-            && is_array_decl(a)
-        {
-            array_names.push(a.name.clone());
-        }
-    }
-
-    // Second pass: check for issues
-    for stmt in stmts {
-        check_statement_with_arrays(stmt, source_id, &array_names, diagnostics);
+        check_statement(stmt, source_id, symbols, scope, diagnostics);
     }
 }
 
-fn is_array_decl(a: &Assignment) -> bool {
-    // Declared with -a or -A flag, or has array_value
-    a.flags.iter().any(|f| f == "-a" || f == "-A") || a.array_value.is_some()
+fn is_array_in_scope(symbols: &SymbolTable, scope: ScopeId, name: &str) -> bool {
+    symbols
+        .resolve(scope, name)
+        .is_some_and(|sym| matches!(sym.type_info.cell_kind, CellKind::IndexedArray | CellKind::AssocArray))
 }
 
-fn check_statement_with_arrays(
+fn check_statement(
     stmt: &Statement,
     source_id: SourceId,
-    array_names: &[String],
+    symbols: &SymbolTable,
+    scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match stmt {
         Statement::Command(cmd) => {
-            check_word_for_bare_array(&cmd.name, source_id, array_names, diagnostics);
+            let cmd_scope = symbols.scope_of_node(cmd.id).unwrap_or(scope);
+            check_word_for_bare_array(&cmd.name, source_id, symbols, cmd_scope, diagnostics);
             for arg in &cmd.args {
-                check_word_for_bare_array(arg, source_id, array_names, diagnostics);
+                check_word_for_bare_array(arg, source_id, symbols, cmd_scope, diagnostics);
             }
             if !is_test_command(cmd) {
                 // BT202: unquoted expansion in command args
@@ -84,51 +82,63 @@ fn check_statement_with_arrays(
         }
         Statement::Pipeline(p) => {
             for cmd in &p.commands {
-                check_statement_with_arrays(cmd, source_id, array_names, diagnostics);
+                check_statement(cmd, source_id, symbols, scope, diagnostics);
             }
         }
         Statement::If(if_stmt) => {
             for s in &if_stmt.condition {
-                check_statement_with_arrays(s, source_id, array_names, diagnostics);
+                check_statement(s, source_id, symbols, scope, diagnostics);
             }
             for s in &if_stmt.then_body {
-                check_statement_with_arrays(s, source_id, array_names, diagnostics);
+                check_statement(s, source_id, symbols, scope, diagnostics);
             }
             if let Some(else_body) = &if_stmt.else_body {
                 for s in else_body {
-                    check_statement_with_arrays(s, source_id, array_names, diagnostics);
+                    check_statement(s, source_id, symbols, scope, diagnostics);
                 }
             }
         }
         Statement::For(for_loop) => {
             for s in &for_loop.body {
-                check_statement_with_arrays(s, source_id, array_names, diagnostics);
+                check_statement(s, source_id, symbols, scope, diagnostics);
             }
         }
         Statement::While(while_loop) => {
             for s in &while_loop.condition {
-                check_statement_with_arrays(s, source_id, array_names, diagnostics);
+                check_statement(s, source_id, symbols, scope, diagnostics);
             }
             for s in &while_loop.body {
-                check_statement_with_arrays(s, source_id, array_names, diagnostics);
+                check_statement(s, source_id, symbols, scope, diagnostics);
             }
         }
         Statement::List(list) => {
             for elem in &list.elements {
-                check_statement_with_arrays(&elem.statement, source_id, array_names, diagnostics);
+                check_statement(&elem.statement, source_id, symbols, scope, diagnostics);
             }
             // BT802: cd followed by ; instead of && within a list
             check_list_for_cd_semi(list, source_id, diagnostics);
         }
         Statement::Block(b) => {
+            let block_scope = symbols.scope_of_node(b.id).unwrap_or(scope);
+            // For subshell blocks, the builder created a child scope; use that for the body
+            let body_scope = if b.subshell {
+                // The subshell scope is the child; body statements are bound there
+                // We can find it by checking the first body statement, or fall back to block_scope
+                b.body.first()
+                    .and_then(stmt_node_id)
+                    .and_then(|id| symbols.scope_of_node(id))
+                    .unwrap_or(block_scope)
+            } else {
+                block_scope
+            };
             for s in &b.body {
-                check_statement_with_arrays(s, source_id, array_names, diagnostics);
+                check_statement(s, source_id, symbols, body_scope, diagnostics);
             }
         }
         Statement::Case(case_stmt) => {
             for arm in &case_stmt.arms {
                 for s in &arm.body {
-                    check_statement_with_arrays(s, source_id, array_names, diagnostics);
+                    check_statement(s, source_id, symbols, scope, diagnostics);
                 }
             }
         }
@@ -147,27 +157,45 @@ fn check_statement_with_arrays(
     }
 }
 
+fn stmt_node_id(stmt: &Statement) -> Option<NodeId> {
+    match stmt {
+        Statement::Assignment(a) => Some(a.id),
+        Statement::Command(c) => Some(c.id),
+        Statement::Pipeline(p) => Some(p.id),
+        Statement::If(i) => Some(i.id),
+        Statement::For(f) => Some(f.id),
+        Statement::While(w) => Some(w.id),
+        Statement::Case(c) => Some(c.id),
+        Statement::List(l) => Some(l.id),
+        Statement::Block(b) => Some(b.id),
+        Statement::Unmodeled(u) => Some(u.id),
+        _ => None,
+    }
+}
+
 fn check_word_for_bare_array(
     word: &Word,
     source_id: SourceId,
-    array_names: &[String],
+    symbols: &SymbolTable,
+    scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for segment in &word.segments {
-        check_segment_for_bare_array(segment, source_id, array_names, diagnostics);
+        check_segment_for_bare_array(segment, source_id, symbols, scope, diagnostics);
     }
 }
 
 fn check_segment_for_bare_array(
     segment: &WordSegment,
     source_id: SourceId,
-    array_names: &[String],
+    symbols: &SymbolTable,
+    scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match segment {
         WordSegment::ParamExpand(pe) => {
             // Bare $arr where arr is a declared array
-            if pe.operator.is_none() && array_names.contains(&pe.name) {
+            if pe.operator.is_none() && is_array_in_scope(symbols, scope, &pe.name) {
                 diagnostics.push(
                     Diagnostic::error(
                         BT201,
@@ -191,11 +219,53 @@ fn check_segment_for_bare_array(
         }
         WordSegment::DoubleQuoted(inner) => {
             for seg in inner {
-                check_segment_for_bare_array(seg, source_id, array_names, diagnostics);
+                check_segment_for_bare_array(seg, source_id, symbols, scope, diagnostics);
             }
         }
         _ => {}
     }
+}
+
+fn check_type_mismatches(
+    symbols: &SymbolTable,
+    source_id: SourceId,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    symbols.for_each_symbol(|sym| {
+        if sym.type_annotation.is_none() {
+            return;
+        }
+        let mismatch = match (sym.type_info.shape, sym.type_info.cell_kind) {
+            (ExpansionShape::Scalar, CellKind::IndexedArray) => Some((
+                "Scalar",
+                "IndexedArray",
+                "annotation declares Scalar but variable is an indexed array",
+            )),
+            (ExpansionShape::Argv, CellKind::Scalar) => Some((
+                "Argv",
+                "Scalar",
+                "annotation declares Argv but variable is a scalar",
+            )),
+            _ => None,
+        };
+        if let Some((ann_shape, bash_kind, message)) = mismatch {
+            diagnostics.push(
+                Diagnostic::error(
+                    BT101,
+                    format!(
+                        "type mismatch for '{}': {}",
+                        sym.name, message
+                    ),
+                    source_id,
+                    sym.decl_span,
+                )
+                .with_help(format!(
+                    "change the annotation to match the declaration, or vice versa (annotation shape: {}, bash kind: {})",
+                    ann_shape, bash_kind
+                )),
+            );
+        }
+    });
 }
 
 fn is_test_command(cmd: &Command) -> bool {
@@ -606,5 +676,47 @@ mod tests {
         let bt802s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT802).collect();
         assert!(bt802s[0].fix.is_some());
         assert_eq!(bt802s[0].fix.as_ref().unwrap().description, "Use && instead of ;");
+    }
+
+    // Symbol-table-aware tests
+
+    #[test]
+    fn bt201_local_array_in_function() {
+        let diagnostics = check_src("foo() { local -a arr=(1 2 3); echo $arr; }");
+        let bt201s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT201).collect();
+        assert_eq!(bt201s.len(), 1);
+    }
+
+    #[test]
+    fn bt201_function_array_not_visible_at_top() {
+        // Array declared in function should not trigger BT201 at top level
+        let diagnostics = check_src("foo() { local -a arr=(1 2 3); }\necho $arr");
+        let bt201s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT201).collect();
+        assert!(bt201s.is_empty());
+    }
+
+    // BT101 tests
+
+    #[test]
+    fn bt101_annotation_conflicts_with_declaration() {
+        // Scalar annotation on an indexed array should trigger BT101
+        let src = "\
+#@type x: Scalar[String]
+declare -a x=(1 2 3)";
+        let diagnostics = check_src(src);
+        let bt101s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT101).collect();
+        assert_eq!(bt101s.len(), 1);
+        assert!(bt101s[0].message.contains("type mismatch"));
+    }
+
+    #[test]
+    fn bt101_no_conflict_when_matching() {
+        // Argv annotation on an indexed array should NOT trigger BT101
+        let src = "\
+#@type x: Argv[String]
+declare -a x=(1 2 3)";
+        let diagnostics = check_src(src);
+        let bt101s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT101).collect();
+        assert!(bt101s.is_empty());
     }
 }

@@ -155,6 +155,7 @@ pub struct Block {
     pub id: NodeId,
     pub span: Span,
     pub body: Vec<Statement>,
+    pub subshell: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

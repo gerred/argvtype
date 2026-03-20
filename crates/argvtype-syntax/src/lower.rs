@@ -229,7 +229,7 @@ impl<'a> LoweringContext<'a> {
                 let id = self.alloc_id();
                 let span = self.node_span(node);
                 let body = self.lower_compound_statement(node);
-                Statement::Block(Block { id, span, body })
+                Statement::Block(Block { id, span, body, subshell: false })
             }
             "list" => self.lower_list(node),
             "subshell" => {
@@ -243,7 +243,7 @@ impl<'a> LoweringContext<'a> {
                         _ => body.push(self.lower_statement(&child)),
                     }
                 }
-                Statement::Block(Block { id, span, body })
+                Statement::Block(Block { id, span, body, subshell: true })
             }
             "redirected_statement" => self.lower_redirected_statement(node),
             "negated_command" => self.lower_negated_command(node),
