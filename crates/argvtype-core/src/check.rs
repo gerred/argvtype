@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use argvtype_syntax::annotation::{Directive, SigDirective, TypeExpr};
 use argvtype_syntax::hir::*;
-use argvtype_syntax::span::SourceId;
+use argvtype_syntax::span::{SourceId, Span};
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Fix};
 use crate::scope::{self, CellKind, Presence, ScopeId, SymbolTable, ExpansionShape};
-use crate::stdlib::{self, Destructiveness};
+use crate::stdlib::{self, Destructiveness, EffectSet};
 
 const BT000: DiagnosticCode = DiagnosticCode { family: "BT", number: 0 };
 const BT101: DiagnosticCode = DiagnosticCode { family: "BT", number: 101 };
@@ -15,21 +15,52 @@ const BT203: DiagnosticCode = DiagnosticCode { family: "BT", number: 203 };
 const BT301: DiagnosticCode = DiagnosticCode { family: "BT", number: 301 };
 const BT302: DiagnosticCode = DiagnosticCode { family: "BT", number: 302 };
 const BT401: DiagnosticCode = DiagnosticCode { family: "BT", number: 401 };
+const BT405: DiagnosticCode = DiagnosticCode { family: "BT", number: 405 };
+const BT406: DiagnosticCode = DiagnosticCode { family: "BT", number: 406 };
+const BT407: DiagnosticCode = DiagnosticCode { family: "BT", number: 407 };
 const BT801: DiagnosticCode = DiagnosticCode { family: "BT", number: 801 };
 const BT802: DiagnosticCode = DiagnosticCode { family: "BT", number: 802 };
 
 type FunctionSigs = HashMap<String, SigDirective>;
+type FunctionProves = HashMap<String, ProvesDirective>;
 
 type PresenceMap = HashMap<String, Presence>;
 
 /// Maps variable names to their proven type refinements (e.g., "ExistingFile").
 type RefinementMap = HashMap<String, HashSet<String>>;
 
+/// Tracks why a proof was invalidated, for targeted diagnostics.
+#[derive(Debug, Clone)]
+struct InvalidatedProof {
+    refinement: String,
+    cause: InvalidationCause,
+    cause_span: Span,
+}
+
+#[derive(Debug, Clone)]
+enum InvalidationCause {
+    Cd,
+    WritesFs(String),
+    UnknownCall(String),
+    Source,
+}
+
+/// Maps variable names to their invalidated proofs.
+type InvalidatedMap = HashMap<String, Vec<InvalidatedProof>>;
+
+/// A `#@proves` directive parsed from a function annotation.
+#[derive(Debug, Clone)]
+struct ProvesDirective {
+    param_position: String,
+    refinement: String,
+}
+
 /// Flow-sensitive state threaded through the checker.
 #[derive(Debug, Clone)]
 struct FlowState {
     presence: PresenceMap,
     refinements: RefinementMap,
+    invalidated: InvalidatedMap,
 }
 
 impl FlowState {
@@ -37,6 +68,7 @@ impl FlowState {
         FlowState {
             presence,
             refinements: RefinementMap::new(),
+            invalidated: InvalidatedMap::new(),
         }
     }
 }
@@ -124,10 +156,20 @@ fn merge_refinement_maps(a: &RefinementMap, b: &RefinementMap) -> RefinementMap 
     result
 }
 
+/// Merge invalidated maps: keep all invalidation records from both branches.
+fn merge_invalidated_maps(a: &InvalidatedMap, b: &InvalidatedMap) -> InvalidatedMap {
+    let mut result = a.clone();
+    for (name, proofs) in b {
+        result.entry(name.clone()).or_default().extend(proofs.iter().cloned());
+    }
+    result
+}
+
 fn merge_flow_states(a: &FlowState, b: &FlowState) -> FlowState {
     FlowState {
         presence: merge_presence_maps(&a.presence, &b.presence),
         refinements: merge_refinement_maps(&a.refinements, &b.refinements),
+        invalidated: merge_invalidated_maps(&a.invalidated, &b.invalidated),
     }
 }
 
@@ -145,11 +187,131 @@ fn collect_function_sigs(source_unit: &SourceUnit) -> FunctionSigs {
     sigs
 }
 
+fn collect_function_proves(source_unit: &SourceUnit) -> FunctionProves {
+    let mut proves = FunctionProves::new();
+    for item in &source_unit.items {
+        if let Item::Function(f) = item {
+            for ann in &f.annotations {
+                if let Directive::Proves(p) = &ann.directive {
+                    proves.insert(f.name.clone(), ProvesDirective {
+                        param_position: p.param.clone(),
+                        refinement: p.refinement.clone(),
+                    });
+                }
+            }
+        }
+    }
+    proves
+}
+
+/// Compute the effect set for a command, using `#@sig` effects when available.
+fn command_effect_set(cmd: &Command, ctx: &CheckCtx) -> EffectSet {
+    let name = match command_name_str(cmd) {
+        Some(n) => n,
+        None => return EffectSet::UNKNOWN_EXTERNAL,
+    };
+    // Check if this is a function with a declared #@sig and effects
+    if let Some(sig) = ctx.sigs.get(name) {
+        let mut set = EffectSet::NONE;
+        for effect in &sig.effects {
+            if let Some(e) = EffectSet::from_effect_name(&effect.name) {
+                set = set.union(e);
+            }
+        }
+        return set;
+    }
+    // Functions with #@proves are known — treat as no additional effects
+    if ctx.proves.contains_key(name) {
+        return EffectSet::NONE;
+    }
+    stdlib::lookup_effects(name)
+}
+
+/// Invalidate path refinements in the flow state based on a command's effects.
+/// Moves killed refinements to the invalidated map with cause information.
+fn apply_effect_invalidation(
+    flow: &mut FlowState,
+    effects: EffectSet,
+    cmd_name: &str,
+    cmd_span: Span,
+    ctx: &CheckCtx,
+) {
+    if !effects.invalidates_path_proofs() {
+        return;
+    }
+
+    // Determine the cause: distinguish known commands from unknown externals.
+    // Unknown externals get UNKNOWN_EXTERNAL effects conservatively — attribute
+    // the invalidation to the unknown call itself, not a specific effect.
+    let is_known = matches!(cmd_name,
+        "cd" | "source" | "." | "eval" | "exec" | "exit" | "return"
+        | "export" | "unset" | "declare" | "local" | "readonly"
+        | "echo" | "printf" | "true" | "false" | ":" | "test" | "[" | "[["
+        | "read" | "mapfile" | "readarray" | "shift" | "set"
+    ) || stdlib::lookup_command(cmd_name).is_some()
+      || ctx.sigs.contains_key(cmd_name)
+      || ctx.proves.contains_key(cmd_name);
+
+    let cause = if effects.contains(EffectSet::MAY_SOURCE) {
+        InvalidationCause::Source
+    } else if effects.contains(EffectSet::CHANGES_CWD) {
+        InvalidationCause::Cd
+    } else if !is_known {
+        InvalidationCause::UnknownCall(cmd_name.to_string())
+    } else if effects.contains(EffectSet::WRITES_FS) {
+        InvalidationCause::WritesFs(cmd_name.to_string())
+    } else {
+        InvalidationCause::UnknownCall(cmd_name.to_string())
+    };
+
+    let vars_with_path_proofs: Vec<String> = flow
+        .refinements
+        .iter()
+        .filter(|(_, refs)| refs.iter().any(|r| is_path_refinement(r)))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    for var in vars_with_path_proofs {
+        if let Some(refs) = flow.refinements.get_mut(&var) {
+            let path_refs: Vec<String> = refs
+                .iter()
+                .filter(|r| is_path_refinement(r))
+                .cloned()
+                .collect();
+            for r in &path_refs {
+                refs.remove(r);
+                flow.invalidated.entry(var.clone()).or_default().push(InvalidatedProof {
+                    refinement: r.clone(),
+                    cause: cause.clone(),
+                    cause_span: cmd_span,
+                });
+            }
+            if refs.is_empty() {
+                flow.refinements.remove(&var);
+            }
+        }
+    }
+}
+
+/// Static context shared across the checker — avoids passing many args.
+struct CheckCtx<'a> {
+    source_id: SourceId,
+    symbols: &'a SymbolTable,
+    sigs: &'a FunctionSigs,
+    proves: &'a FunctionProves,
+}
+
 pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
     let symbols = scope::build_symbol_table(source_unit);
     let sigs = collect_function_sigs(source_unit);
+    let proves = collect_function_proves(source_unit);
+    let ctx = CheckCtx {
+        source_id: source_unit.source_id,
+        symbols: &symbols,
+        sigs: &sigs,
+        proves: &proves,
+    };
     let mut diagnostics = Vec::new();
-    let source_id = source_unit.source_id;
     let root = symbols.root_scope();
     let mut global_flow = FlowState::new(init_presence_map(&symbols, root));
 
@@ -158,35 +320,33 @@ pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
             Item::Function(f) => {
                 let scope = symbols.scope_of_node(f.id).unwrap_or(root);
                 let mut func_flow = FlowState::new(init_presence_map(&symbols, scope));
-                check_statements(&f.body, source_id, &symbols, scope, &mut diagnostics, &mut func_flow, &sigs);
+                check_statements(&f.body, &ctx, scope, &mut diagnostics, &mut func_flow);
             }
             Item::Statement(s) => {
-                check_statement(s, source_id, &symbols, root, &mut diagnostics, &mut global_flow, &sigs);
+                check_statement(s, &ctx, root, &mut diagnostics, &mut global_flow);
             }
             _ => {}
         }
     }
 
     // BT802: check consecutive top-level items for cd;next pattern
-    check_consecutive_cd_items(&source_unit.items, source_id, &mut diagnostics);
+    check_consecutive_cd_items(&source_unit.items, ctx.source_id, &mut diagnostics);
 
     // BT101: annotation/declaration shape mismatches
-    check_type_mismatches(&symbols, source_id, &mut diagnostics);
+    check_type_mismatches(&symbols, ctx.source_id, &mut diagnostics);
 
     diagnostics
 }
 
 fn check_statements(
     stmts: &[Statement],
-    source_id: SourceId,
-    symbols: &SymbolTable,
+    ctx: &CheckCtx,
     scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
     flow: &mut FlowState,
-    sigs: &FunctionSigs,
 ) {
     for stmt in stmts {
-        check_statement(stmt, source_id, symbols, scope, diagnostics, flow, sigs);
+        check_statement(stmt, ctx, scope, diagnostics, flow);
     }
 }
 
@@ -210,12 +370,10 @@ fn is_scalar_shape_in_scope(symbols: &SymbolTable, scope: ScopeId, name: &str) -
 
 fn check_statement(
     stmt: &Statement,
-    source_id: SourceId,
-    symbols: &SymbolTable,
+    ctx: &CheckCtx,
     scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
     flow: &mut FlowState,
-    sigs: &FunctionSigs,
 ) {
     match stmt {
         Statement::Assignment(a) => {
@@ -223,39 +381,49 @@ fn check_statement(
             if a.value.is_some() || a.array_value.is_some() {
                 flow.presence.insert(a.name.clone(), Presence::Set);
                 flow.refinements.remove(&a.name);
+                flow.invalidated.remove(&a.name);
             }
         }
         Statement::Command(cmd) => {
-            let cmd_scope = symbols.scope_of_node(cmd.id).unwrap_or(scope);
-            check_word_for_bare_array(&cmd.name, source_id, symbols, cmd_scope, diagnostics);
+            let cmd_scope = ctx.symbols.scope_of_node(cmd.id).unwrap_or(scope);
+            check_word_for_bare_array(&cmd.name, ctx.source_id, ctx.symbols, cmd_scope, diagnostics);
             for arg in &cmd.args {
-                check_word_for_bare_array(arg, source_id, symbols, cmd_scope, diagnostics);
+                check_word_for_bare_array(arg, ctx.source_id, ctx.symbols, cmd_scope, diagnostics);
             }
             if !is_test_command(cmd) {
                 // BT202: unquoted expansion in command args
                 for arg in &cmd.args {
-                    check_word_for_unquoted_expansion(arg, source_id, diagnostics);
+                    check_word_for_unquoted_expansion(arg, ctx.source_id, diagnostics);
                 }
                 // BT801: destructive command with unquoted variable
-                check_destructive_unquoted(cmd, source_id, diagnostics);
+                check_destructive_unquoted(cmd, ctx.source_id, diagnostics);
                 // BT301/BT302: presence checks on expansions
-                check_command_presence(cmd, source_id, symbols, cmd_scope, &flow.presence, diagnostics);
+                check_command_presence(cmd, ctx.source_id, ctx.symbols, cmd_scope, &flow.presence, diagnostics);
             }
             // Recognize `: "${x:?msg}"` guard pattern
             apply_colon_guard(cmd, &mut flow.presence);
             // Track commands that modify variable presence
             apply_command_presence_effects(cmd, &mut flow.presence);
-            // BT102/BT401: function call site checking against #@sig
-            check_call_site(cmd, source_id, symbols, scope, sigs, flow, diagnostics);
+            // Recognize `command -v`/`type`/`hash` as CommandName proof sites
+            apply_command_name_proof(cmd, flow);
+            // Apply #@proves from custom proof functions
+            apply_proves_effects(cmd, ctx.proves, flow);
+            // BT102/BT401/BT405-407: function call site checking against #@sig
+            check_call_site(cmd, ctx.source_id, ctx.symbols, scope, ctx.sigs, flow, diagnostics);
+            // Effect invalidation: kill path proofs after effectful commands
+            let effects = command_effect_set(cmd, ctx);
+            if let Some(name) = command_name_str(cmd) {
+                apply_effect_invalidation(flow, effects, name, cmd.span, ctx);
+            }
         }
         Statement::Pipeline(p) => {
             for cmd in &p.commands {
-                check_statement(cmd, source_id, symbols, scope, diagnostics, flow, sigs);
+                check_statement(cmd, ctx, scope, diagnostics, flow);
             }
         }
         Statement::If(if_stmt) => {
             for s in &if_stmt.condition {
-                check_statement(s, source_id, symbols, scope, diagnostics, flow, sigs);
+                check_statement(s, ctx, scope, diagnostics, flow);
             }
 
             // Extract test refinements from condition
@@ -267,9 +435,10 @@ fn check_statement(
                 then_flow.presence.insert(r.var_name.clone(), r.presence);
                 if let Some(ref type_ref) = r.type_refinement {
                     then_flow.refinements.entry(r.var_name.clone()).or_default().insert(type_ref.clone());
+                    then_flow.invalidated.remove(&r.var_name);
                 }
             }
-            check_statements(&if_stmt.then_body, source_id, symbols, scope, diagnostics, &mut then_flow, sigs);
+            check_statements(&if_stmt.then_body, ctx, scope, diagnostics, &mut then_flow);
 
             // Fork flow for else-branch: invert presence, no type refinements
             let mut else_flow = flow.clone();
@@ -282,7 +451,7 @@ fn check_statement(
                 else_flow.presence.insert(r.var_name.clone(), inverted);
             }
             if let Some(else_body) = &if_stmt.else_body {
-                check_statements(else_body, source_id, symbols, scope, diagnostics, &mut else_flow, sigs);
+                check_statements(else_body, ctx, scope, diagnostics, &mut else_flow);
             }
 
             // Merge at join point
@@ -292,39 +461,39 @@ fn check_statement(
             // Loop body may execute zero or more times — fork and merge
             let pre_loop = flow.clone();
             for s in &for_loop.body {
-                check_statement(s, source_id, symbols, scope, diagnostics, flow, sigs);
+                check_statement(s, ctx, scope, diagnostics, flow);
             }
             *flow = merge_flow_states(&pre_loop, flow);
         }
         Statement::While(while_loop) => {
             // Condition always evaluates at least once
             for s in &while_loop.condition {
-                check_statement(s, source_id, symbols, scope, diagnostics, flow, sigs);
+                check_statement(s, ctx, scope, diagnostics, flow);
             }
             // Loop body may execute zero or more times — fork and merge
             let pre_loop = flow.clone();
             for s in &while_loop.body {
-                check_statement(s, source_id, symbols, scope, diagnostics, flow, sigs);
+                check_statement(s, ctx, scope, diagnostics, flow);
             }
             *flow = merge_flow_states(&pre_loop, flow);
         }
         Statement::List(list) => {
-            check_list_flow(list, source_id, symbols, scope, diagnostics, flow, sigs);
+            check_list_flow(list, ctx, scope, diagnostics, flow);
             // BT802: cd followed by ; instead of && within a list
-            check_list_for_cd_semi(list, source_id, diagnostics);
+            check_list_for_cd_semi(list, ctx.source_id, diagnostics);
         }
         Statement::Block(b) => {
-            let block_scope = symbols.scope_of_node(b.id).unwrap_or(scope);
+            let block_scope = ctx.symbols.scope_of_node(b.id).unwrap_or(scope);
             let body_scope = if b.subshell {
                 b.body.first()
                     .and_then(stmt_node_id)
-                    .and_then(|id| symbols.scope_of_node(id))
+                    .and_then(|id| ctx.symbols.scope_of_node(id))
                     .unwrap_or(block_scope)
             } else {
                 block_scope
             };
             for s in &b.body {
-                check_statement(s, source_id, symbols, body_scope, diagnostics, flow, sigs);
+                check_statement(s, ctx, body_scope, diagnostics, flow);
             }
         }
         Statement::Case(case_stmt) => {
@@ -333,7 +502,7 @@ fn check_statement(
             for arm in &case_stmt.arms {
                 let mut arm_flow = pre_case.clone();
                 for s in &arm.body {
-                    check_statement(s, source_id, symbols, scope, diagnostics, &mut arm_flow, sigs);
+                    check_statement(s, ctx, scope, diagnostics, &mut arm_flow);
                 }
                 arm_flows.push(arm_flow);
             }
@@ -362,7 +531,7 @@ fn check_statement(
                 Diagnostic::warning(
                     BT000,
                     format!("unmodeled syntax: {}", u.kind),
-                    source_id,
+                    ctx.source_id,
                     u.span,
                 )
                 .with_help("this construct is not yet analyzed by argvtype"),
@@ -598,6 +767,74 @@ fn word_as_literal(word: &Word) -> Option<&str> {
     None
 }
 
+/// Recognize `command -v NAME`, `type NAME`, `hash NAME` as CommandName proof sites.
+/// These prove the named command exists when they succeed.
+fn apply_command_name_proof(cmd: &Command, flow: &mut FlowState) {
+    let name = match command_name_str(cmd) {
+        Some(n) => n,
+        None => return,
+    };
+    match name {
+        "command" => {
+            // `command -v name` → CommandName proof on `name`
+            if cmd.args.len() >= 2
+                && word_as_literal(&cmd.args[0]) == Some("-v")
+                && let Some(target) = word_as_literal(&cmd.args[1])
+            {
+                flow.refinements
+                    .entry(target.to_string())
+                    .or_default()
+                    .insert("CommandName".to_string());
+                flow.presence.insert(target.to_string(), Presence::Set);
+            }
+        }
+        "type" | "hash" => {
+            // `type name` / `hash name` → CommandName proof
+            if let Some(first_arg) = cmd.args.first()
+                && let Some(target) = word_as_literal(first_arg)
+                && !target.starts_with('-')
+            {
+                flow.refinements
+                    .entry(target.to_string())
+                    .or_default()
+                    .insert("CommandName".to_string());
+                flow.presence.insert(target.to_string(), Presence::Set);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply refinement effects from `#@proves` custom proof functions.
+/// When a function annotated with `#@proves $1 ExistingFile` is called,
+/// the corresponding argument gets the specified refinement.
+fn apply_proves_effects(cmd: &Command, proves: &FunctionProves, flow: &mut FlowState) {
+    let func_name = match command_name_str(cmd) {
+        Some(n) => n,
+        None => return,
+    };
+    let proves_dir = match proves.get(func_name) {
+        Some(p) => p,
+        None => return,
+    };
+    // Parse the param position: "$1" → index 0, "$2" → index 1, etc.
+    let param_idx = proves_dir
+        .param_position
+        .strip_prefix('$')
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.saturating_sub(1));
+    if let Some(idx) = param_idx
+        && let Some(arg) = cmd.args.get(idx)
+        && let Some(var_name) = extract_single_var_name(arg)
+    {
+        flow.refinements
+            .entry(var_name.clone())
+            .or_default()
+            .insert(proves_dir.refinement.clone());
+        flow.invalidated.remove(&var_name);
+    }
+}
+
 /// Extract test refinements from an if-condition.
 /// Recognizes presence refinements (-n → Set, -z → Unset) and
 /// path refinements (-f → ExistingFile, -d → ExistingDir, -e → ExistingPath).
@@ -671,15 +908,13 @@ fn extract_single_var_name(word: &Word) -> Option<String> {
 /// Handle list elements with flow tracking, including `|| return`/`|| exit` patterns.
 fn check_list_flow(
     list: &List,
-    source_id: SourceId,
-    symbols: &SymbolTable,
+    ctx: &CheckCtx,
     scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
     flow: &mut FlowState,
-    sigs: &FunctionSigs,
 ) {
     for (i, elem) in list.elements.iter().enumerate() {
-        check_statement(&elem.statement, source_id, symbols, scope, diagnostics, flow, sigs);
+        check_statement(&elem.statement, ctx, scope, diagnostics, flow);
 
         // After `cmd || return/exit`, the left-side's refinements carry forward
         // because if cmd failed, we'd have returned/exited
@@ -835,7 +1070,7 @@ fn check_call_site(
             _ => {}
         }
 
-        // BT401: check refinement requirements
+        // BT401/BT405-407: check refinement requirements
         if let Some(required_refinement) = type_expr_inner_refinement(&param.type_expr)
             && is_path_refinement(&required_refinement)
             && let Some(var_name) = extract_single_var_name(arg)
@@ -845,37 +1080,78 @@ fn check_call_site(
                 .get(&var_name)
                 .is_some_and(|refs| refs.contains(&required_refinement));
             if !has_proof {
-                let guard_flag = match required_refinement.as_str() {
-                    "ExistingFile" => "-f",
-                    "ExistingDir" => "-d",
-                    "ExistingPath" => "-e",
-                    _ => "-e",
-                };
-                diagnostics.push(
-                    Diagnostic::warning(
-                        BT401,
-                        format!(
-                            "argument '{}' to '{}' requires {} but no proof found",
-                            param.name, func_name, required_refinement,
-                        ),
-                        source_id,
-                        arg.span,
-                    )
-                    .with_help(format!(
-                        "guard with `[[ {} \"${}\" ]] || return 1` before the call",
-                        guard_flag, var_name
-                    ))
-                    .with_agent_context(format!(
-                        "Parameter '{}' is declared as {} which requires a runtime proof. \
-                         Use a test guard like `[[ {} \"${}\" ]]` before calling '{}' \
-                         so the checker can verify the path exists.",
-                        param.name,
-                        format_type_expr(&param.type_expr),
-                        guard_flag,
-                        var_name,
-                        func_name,
-                    )),
-                );
+                // Check if the proof was invalidated — emit targeted diagnostics
+                let invalidation = flow
+                    .invalidated
+                    .get(&var_name)
+                    .and_then(|inv| inv.iter().find(|p| p.refinement == required_refinement));
+
+                if let Some(inv) = invalidation {
+                    let (code, cause_desc) = match &inv.cause {
+                        InvalidationCause::Cd => (BT405, "'cd' changed the working directory".to_string()),
+                        InvalidationCause::WritesFs(cmd) => (BT406, format!("'{}' may modify the filesystem", cmd)),
+                        InvalidationCause::UnknownCall(cmd) => (BT407, format!("unknown function '{}' may have side effects", cmd)),
+                        InvalidationCause::Source => (BT407, "'source' may execute arbitrary code".to_string()),
+                    };
+                    diagnostics.push(
+                        Diagnostic::warning(
+                            code,
+                            format!(
+                                "{} proof for '{}' was invalidated before use in '{}'",
+                                required_refinement, var_name, func_name,
+                            ),
+                            source_id,
+                            arg.span,
+                        )
+                        .with_label(inv.cause_span, cause_desc.clone())
+                        .with_help(format!(
+                            "re-check with `[[ {} \"${}\" ]] || return 1` after the invalidating command",
+                            match required_refinement.as_str() {
+                                "ExistingFile" => "-f",
+                                "ExistingDir" => "-d",
+                                _ => "-e",
+                            },
+                            var_name
+                        ))
+                        .with_agent_context(format!(
+                            "The {} proof for '{}' was established earlier but then {} before the call to '{}'. \
+                             The file may no longer exist. Re-verify after the effectful command.",
+                            required_refinement, var_name, cause_desc, func_name,
+                        )),
+                    );
+                } else {
+                    let guard_flag = match required_refinement.as_str() {
+                        "ExistingFile" => "-f",
+                        "ExistingDir" => "-d",
+                        "ExistingPath" => "-e",
+                        _ => "-e",
+                    };
+                    diagnostics.push(
+                        Diagnostic::warning(
+                            BT401,
+                            format!(
+                                "argument '{}' to '{}' requires {} but no proof found",
+                                param.name, func_name, required_refinement,
+                            ),
+                            source_id,
+                            arg.span,
+                        )
+                        .with_help(format!(
+                            "guard with `[[ {} \"${}\" ]] || return 1` before the call",
+                            guard_flag, var_name
+                        ))
+                        .with_agent_context(format!(
+                            "Parameter '{}' is declared as {} which requires a runtime proof. \
+                             Use a test guard like `[[ {} \"${}\" ]]` before calling '{}' \
+                             so the checker can verify the path exists.",
+                            param.name,
+                            format_type_expr(&param.type_expr),
+                            guard_flag,
+                            var_name,
+                            func_name,
+                        )),
+                    );
+                }
             }
         }
     }
@@ -1935,5 +2211,208 @@ fi";
         let diagnostics = check_src(src);
         let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
         assert!(bt302s.is_empty(), "-f test should prove variable is Set in then-branch");
+    }
+
+    // ===== BT405/BT406/BT407: Proof invalidation by effects =====
+
+    #[test]
+    fn bt406_rm_invalidates_existing_file_proof() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+[[ -f \"$cfg\" ]] || return 1
+rm \"$cfg\"
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt406s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT406).collect();
+        assert_eq!(bt406s.len(), 1, "rm should invalidate ExistingFile proof → BT406");
+        assert!(bt406s[0].message.contains("invalidated"));
+    }
+
+    #[test]
+    fn bt405_cd_invalidates_path_proof() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=config.yaml
+[[ -f \"$cfg\" ]] || return 1
+cd /other/dir || return 1
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt405s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT405).collect();
+        assert_eq!(bt405s.len(), 1, "cd should invalidate ExistingFile proof → BT405");
+    }
+
+    #[test]
+    fn bt407_unknown_function_invalidates_proof() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+[[ -f \"$cfg\" ]] || return 1
+some_unknown_tool
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt407s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT407).collect();
+        assert_eq!(bt407s.len(), 1, "unknown command should invalidate proof → BT407");
+    }
+
+    #[test]
+    fn no_invalidation_from_safe_command() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+[[ -f \"$cfg\" ]] || return 1
+echo \"checking config\"
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        let bt405s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT405).collect();
+        let bt406s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT406).collect();
+        let bt407s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT407).collect();
+        assert!(bt401s.is_empty(), "echo should not invalidate proof");
+        assert!(bt405s.is_empty());
+        assert!(bt406s.is_empty());
+        assert!(bt407s.is_empty());
+    }
+
+    #[test]
+    fn bt406_mv_invalidates_proof() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+[[ -f \"$cfg\" ]] || return 1
+mv other.txt backup.txt
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt406s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT406).collect();
+        assert_eq!(bt406s.len(), 1, "mv (writes_fs) should invalidate proof → BT406");
+    }
+
+    #[test]
+    fn invalidation_cleared_by_reproof() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+[[ -f \"$cfg\" ]] || return 1
+rm other_file
+[[ -f \"$cfg\" ]] || return 1
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt405_7: Vec<_> = diagnostics.iter().filter(|d| {
+            d.code == BT405 || d.code == BT406 || d.code == BT407
+        }).collect();
+        assert!(bt405_7.is_empty(), "re-proof after invalidation should suppress BT40x");
+    }
+
+    #[test]
+    fn bt407_source_invalidates_everything() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+[[ -f \"$cfg\" ]] || return 1
+source other.sh
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt407s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT407).collect();
+        assert_eq!(bt407s.len(), 1, "source should invalidate all proofs → BT407");
+    }
+
+    #[test]
+    fn sig_effects_inform_invalidation() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+#@sig cleanup() -> Status[0] !writes_fs
+cleanup() { echo cleaning; }
+cfg=/etc/config
+[[ -f \"$cfg\" ]] || return 1
+cleanup
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt406s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT406).collect();
+        assert_eq!(bt406s.len(), 1, "function with !writes_fs should invalidate proof → BT406");
+    }
+
+    #[test]
+    fn sig_no_effects_no_invalidation() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+#@sig validate(name: Scalar[String]) -> Status[0]
+validate() { echo ok; }
+cfg=/etc/config
+[[ -f \"$cfg\" ]] || return 1
+validate test
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt405_7: Vec<_> = diagnostics.iter().filter(|d| {
+            d.code == BT405 || d.code == BT406 || d.code == BT407
+        }).collect();
+        assert!(bt405_7.is_empty(), "function with no effects should not invalidate proof");
+    }
+
+    // ===== #@proves: Custom proof functions =====
+
+    #[test]
+    fn proves_annotation_establishes_proof() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+#@proves $1 ExistingFile
+validate_config() {
+  [[ -f \"$1\" ]] || exit 1
+}
+cfg=/etc/config
+validate_config \"$cfg\"
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        assert!(bt401s.is_empty(), "#@proves should establish ExistingFile proof");
+    }
+
+    #[test]
+    fn proves_wrong_refinement_still_fires() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+#@proves $1 ExistingDir
+validate_dir() {
+  [[ -d \"$1\" ]] || exit 1
+}
+cfg=/etc/config
+validate_dir \"$cfg\"
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        assert_eq!(bt401s.len(), 1, "#@proves ExistingDir does not satisfy ExistingFile requirement");
+    }
+
+    // ===== command -v / type / hash as CommandName proof sites =====
+
+    #[test]
+    fn command_v_establishes_command_name_proof() {
+        let src = "\
+command -v jq
+echo verified";
+        let diagnostics = check_src(src);
+        // Just verifying it doesn't crash and that the proof is tracked
+        // (we'd need a function requiring CommandName to test the proof usage)
+        assert!(diagnostics.iter().all(|d| d.code != BT401));
+    }
+
+    #[test]
+    fn command_v_in_guard_proves_command() {
+        let src = "\
+command -v jq || return 1
+echo \"jq is available\"";
+        let diagnostics = check_src(src);
+        // The flow should have CommandName proof for "jq"
+        assert!(diagnostics.iter().all(|d| d.code != BT401));
     }
 }

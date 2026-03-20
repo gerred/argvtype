@@ -15,7 +15,16 @@ pub enum Directive {
     Bind(BindDirective),
     Type(TypeDirective),
     Module(ModuleDirective),
+    Proves(ProvesDirective),
     Unknown { name: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvesDirective {
+    /// The parameter reference (e.g., "$1")
+    pub param: String,
+    /// The refinement established (e.g., "ExistingFile")
+    pub refinement: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +120,7 @@ fn parse_directive(body: &str, span: Span) -> Result<Directive, AnnotationError>
         "bind" => parse_bind(rest, span),
         "type" => parse_type_directive(rest, span),
         "module" => parse_module(rest, span),
+        "proves" => parse_proves(rest, span),
         _ => Ok(Directive::Unknown {
             name: keyword.to_string(),
         }),
@@ -287,6 +297,21 @@ fn parse_type_directive(rest: &str, span: Span) -> Result<Directive, AnnotationE
     Ok(Directive::Type(TypeDirective { name, type_expr }))
 }
 
+fn parse_proves(rest: &str, span: Span) -> Result<Directive, AnnotationError> {
+    // Format: $N RefinementType (e.g., "$1 ExistingFile")
+    let (param, refinement) = split_first_word(rest);
+    if param.is_empty() || refinement.is_empty() {
+        return Err(AnnotationError::Malformed {
+            span,
+            message: "expected '$N RefinementType' in proves directive".into(),
+        });
+    }
+    Ok(Directive::Proves(ProvesDirective {
+        param: param.to_string(),
+        refinement: refinement.to_string(),
+    }))
+}
+
 fn parse_module(rest: &str, span: Span) -> Result<Directive, AnnotationError> {
     let rest = rest.trim();
     if rest.is_empty() {
@@ -421,6 +446,27 @@ mod tests {
         assert!(anns.is_empty());
         assert_eq!(errs.len(), 1);
         assert!(matches!(&errs[0], AnnotationError::Malformed { .. }));
+    }
+
+    #[test]
+    fn parse_proves_directive() {
+        let (anns, errs) = parse("#@proves $1 ExistingFile");
+        assert!(errs.is_empty(), "errors: {:?}", errs);
+        assert_eq!(anns.len(), 1);
+        match &anns[0].directive {
+            Directive::Proves(p) => {
+                assert_eq!(p.param, "$1");
+                assert_eq!(p.refinement, "ExistingFile");
+            }
+            other => panic!("expected Proves, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_proves_malformed() {
+        let (anns, errs) = parse("#@proves $1");
+        assert!(anns.is_empty());
+        assert_eq!(errs.len(), 1);
     }
 
     #[test]
