@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use argvtype_syntax::annotation::{Directive, SigDirective, TypeExpr};
 use argvtype_syntax::hir::*;
 use argvtype_syntax::span::SourceId;
@@ -14,12 +14,39 @@ const BT202: DiagnosticCode = DiagnosticCode { family: "BT", number: 202 };
 const BT203: DiagnosticCode = DiagnosticCode { family: "BT", number: 203 };
 const BT301: DiagnosticCode = DiagnosticCode { family: "BT", number: 301 };
 const BT302: DiagnosticCode = DiagnosticCode { family: "BT", number: 302 };
+const BT401: DiagnosticCode = DiagnosticCode { family: "BT", number: 401 };
 const BT801: DiagnosticCode = DiagnosticCode { family: "BT", number: 801 };
 const BT802: DiagnosticCode = DiagnosticCode { family: "BT", number: 802 };
 
 type FunctionSigs = HashMap<String, SigDirective>;
 
 type PresenceMap = HashMap<String, Presence>;
+
+/// Maps variable names to their proven type refinements (e.g., "ExistingFile").
+type RefinementMap = HashMap<String, HashSet<String>>;
+
+/// Flow-sensitive state threaded through the checker.
+#[derive(Debug, Clone)]
+struct FlowState {
+    presence: PresenceMap,
+    refinements: RefinementMap,
+}
+
+impl FlowState {
+    fn new(presence: PresenceMap) -> Self {
+        FlowState {
+            presence,
+            refinements: RefinementMap::new(),
+        }
+    }
+}
+
+/// A refinement extracted from a test condition.
+struct TestRefinement {
+    var_name: String,
+    presence: Presence,
+    type_refinement: Option<String>,
+}
 
 const WELL_KNOWN_SET_VARS: &[&str] = &[
     "PATH", "HOME", "USER", "SHELL", "PWD", "OLDPWD", "IFS",
@@ -83,6 +110,27 @@ fn merge_presence_maps(a: &PresenceMap, b: &PresenceMap) -> PresenceMap {
     result
 }
 
+/// Merge refinement maps: a refinement survives only if proven in both branches.
+fn merge_refinement_maps(a: &RefinementMap, b: &RefinementMap) -> RefinementMap {
+    let mut result = RefinementMap::new();
+    for (name, a_refs) in a {
+        if let Some(b_refs) = b.get(name) {
+            let intersection: HashSet<String> = a_refs.intersection(b_refs).cloned().collect();
+            if !intersection.is_empty() {
+                result.insert(name.clone(), intersection);
+            }
+        }
+    }
+    result
+}
+
+fn merge_flow_states(a: &FlowState, b: &FlowState) -> FlowState {
+    FlowState {
+        presence: merge_presence_maps(&a.presence, &b.presence),
+        refinements: merge_refinement_maps(&a.refinements, &b.refinements),
+    }
+}
+
 fn collect_function_sigs(source_unit: &SourceUnit) -> FunctionSigs {
     let mut sigs = FunctionSigs::new();
     for item in &source_unit.items {
@@ -103,17 +151,17 @@ pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let source_id = source_unit.source_id;
     let root = symbols.root_scope();
-    let mut global_presence = init_presence_map(&symbols, root);
+    let mut global_flow = FlowState::new(init_presence_map(&symbols, root));
 
     for item in &source_unit.items {
         match item {
             Item::Function(f) => {
                 let scope = symbols.scope_of_node(f.id).unwrap_or(root);
-                let mut func_presence = init_presence_map(&symbols, scope);
-                check_statements(&f.body, source_id, &symbols, scope, &mut diagnostics, &mut func_presence, &sigs);
+                let mut func_flow = FlowState::new(init_presence_map(&symbols, scope));
+                check_statements(&f.body, source_id, &symbols, scope, &mut diagnostics, &mut func_flow, &sigs);
             }
             Item::Statement(s) => {
-                check_statement(s, source_id, &symbols, root, &mut diagnostics, &mut global_presence, &sigs);
+                check_statement(s, source_id, &symbols, root, &mut diagnostics, &mut global_flow, &sigs);
             }
             _ => {}
         }
@@ -134,11 +182,11 @@ fn check_statements(
     symbols: &SymbolTable,
     scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
-    presence: &mut PresenceMap,
+    flow: &mut FlowState,
     sigs: &FunctionSigs,
 ) {
     for stmt in stmts {
-        check_statement(stmt, source_id, symbols, scope, diagnostics, presence, sigs);
+        check_statement(stmt, source_id, symbols, scope, diagnostics, flow, sigs);
     }
 }
 
@@ -166,14 +214,15 @@ fn check_statement(
     symbols: &SymbolTable,
     scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
-    presence: &mut PresenceMap,
+    flow: &mut FlowState,
     sigs: &FunctionSigs,
 ) {
     match stmt {
         Statement::Assignment(a) => {
-            // Assignment sets the variable
+            // Assignment sets the variable and clears path refinements
             if a.value.is_some() || a.array_value.is_some() {
-                presence.insert(a.name.clone(), Presence::Set);
+                flow.presence.insert(a.name.clone(), Presence::Set);
+                flow.refinements.remove(&a.name);
             }
         }
         Statement::Command(cmd) => {
@@ -190,74 +239,77 @@ fn check_statement(
                 // BT801: destructive command with unquoted variable
                 check_destructive_unquoted(cmd, source_id, diagnostics);
                 // BT301/BT302: presence checks on expansions
-                check_command_presence(cmd, source_id, symbols, cmd_scope, presence, diagnostics);
+                check_command_presence(cmd, source_id, symbols, cmd_scope, &flow.presence, diagnostics);
             }
             // Recognize `: "${x:?msg}"` guard pattern
-            apply_colon_guard(cmd, presence);
+            apply_colon_guard(cmd, &mut flow.presence);
             // Track commands that modify variable presence
-            apply_command_presence_effects(cmd, presence);
-            // BT102: function call site checking against #@sig
-            check_call_site(cmd, source_id, symbols, scope, sigs, diagnostics);
+            apply_command_presence_effects(cmd, &mut flow.presence);
+            // BT102/BT401: function call site checking against #@sig
+            check_call_site(cmd, source_id, symbols, scope, sigs, flow, diagnostics);
         }
         Statement::Pipeline(p) => {
             for cmd in &p.commands {
-                check_statement(cmd, source_id, symbols, scope, diagnostics, presence, sigs);
+                check_statement(cmd, source_id, symbols, scope, diagnostics, flow, sigs);
             }
         }
         Statement::If(if_stmt) => {
             for s in &if_stmt.condition {
-                check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
+                check_statement(s, source_id, symbols, scope, diagnostics, flow, sigs);
             }
 
             // Extract test refinements from condition
             let refinements = extract_test_refinements(&if_stmt.condition);
 
-            // Fork presence for then-branch
-            let mut then_presence = presence.clone();
-            for (name, p) in &refinements {
-                then_presence.insert(name.clone(), *p);
+            // Fork flow for then-branch: apply refinements
+            let mut then_flow = flow.clone();
+            for r in &refinements {
+                then_flow.presence.insert(r.var_name.clone(), r.presence);
+                if let Some(ref type_ref) = r.type_refinement {
+                    then_flow.refinements.entry(r.var_name.clone()).or_default().insert(type_ref.clone());
+                }
             }
-            check_statements(&if_stmt.then_body, source_id, symbols, scope, diagnostics, &mut then_presence, sigs);
+            check_statements(&if_stmt.then_body, source_id, symbols, scope, diagnostics, &mut then_flow, sigs);
 
-            // Fork presence for else-branch (inverted refinements)
-            let mut else_presence = presence.clone();
-            for (name, p) in &refinements {
-                let inverted = match p {
+            // Fork flow for else-branch: invert presence, no type refinements
+            let mut else_flow = flow.clone();
+            for r in &refinements {
+                let inverted = match r.presence {
                     Presence::Set => Presence::MaybeUnset,
                     Presence::Unset => Presence::Set,
-                    other => *other,
+                    other => other,
                 };
-                else_presence.insert(name.clone(), inverted);
+                else_flow.presence.insert(r.var_name.clone(), inverted);
             }
             if let Some(else_body) = &if_stmt.else_body {
-                check_statements(else_body, source_id, symbols, scope, diagnostics, &mut else_presence, sigs);
+                check_statements(else_body, source_id, symbols, scope, diagnostics, &mut else_flow, sigs);
             }
 
             // Merge at join point
-            *presence = merge_presence_maps(&then_presence, &else_presence);
+            *flow = merge_flow_states(&then_flow, &else_flow);
         }
         Statement::For(for_loop) => {
             // Loop body may execute zero or more times — fork and merge
-            let pre_loop = presence.clone();
+            let pre_loop = flow.clone();
             for s in &for_loop.body {
-                check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
+                check_statement(s, source_id, symbols, scope, diagnostics, flow, sigs);
             }
-            *presence = merge_presence_maps(&pre_loop, presence);
+            *flow = merge_flow_states(&pre_loop, flow);
         }
         Statement::While(while_loop) => {
             // Condition always evaluates at least once
             for s in &while_loop.condition {
-                check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
+                check_statement(s, source_id, symbols, scope, diagnostics, flow, sigs);
             }
             // Loop body may execute zero or more times — fork and merge
-            let pre_loop = presence.clone();
+            let pre_loop = flow.clone();
             for s in &while_loop.body {
-                check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
+                check_statement(s, source_id, symbols, scope, diagnostics, flow, sigs);
             }
-            *presence = merge_presence_maps(&pre_loop, presence);
+            *flow = merge_flow_states(&pre_loop, flow);
         }
         Statement::List(list) => {
-            check_list_presence(list, source_id, symbols, scope, diagnostics, presence, sigs);
+            check_list_flow(list, source_id, symbols, scope, diagnostics, flow, sigs);
             // BT802: cd followed by ; instead of && within a list
             check_list_for_cd_semi(list, source_id, diagnostics);
         }
@@ -272,18 +324,18 @@ fn check_statement(
                 block_scope
             };
             for s in &b.body {
-                check_statement(s, source_id, symbols, body_scope, diagnostics, presence, sigs);
+                check_statement(s, source_id, symbols, body_scope, diagnostics, flow, sigs);
             }
         }
         Statement::Case(case_stmt) => {
-            let pre_case = presence.clone();
-            let mut arm_presences: Vec<PresenceMap> = Vec::new();
+            let pre_case = flow.clone();
+            let mut arm_flows: Vec<FlowState> = Vec::new();
             for arm in &case_stmt.arms {
-                let mut arm_presence = pre_case.clone();
+                let mut arm_flow = pre_case.clone();
                 for s in &arm.body {
-                    check_statement(s, source_id, symbols, scope, diagnostics, &mut arm_presence, sigs);
+                    check_statement(s, source_id, symbols, scope, diagnostics, &mut arm_flow, sigs);
                 }
-                arm_presences.push(arm_presence);
+                arm_flows.push(arm_flow);
             }
             // If no wildcard/default arm, case might not match — include pre-case state
             let has_default = case_stmt.arms.iter().any(|arm| {
@@ -294,15 +346,15 @@ fn check_statement(
                 })
             });
             if !has_default {
-                arm_presences.push(pre_case);
+                arm_flows.push(pre_case);
             }
-            // Merge all arm presences
-            if let Some(first) = arm_presences.first().cloned() {
+            // Merge all arm flow states
+            if let Some(first) = arm_flows.first().cloned() {
                 let mut merged = first;
-                for arm_p in &arm_presences[1..] {
-                    merged = merge_presence_maps(&merged, arm_p);
+                for arm_f in &arm_flows[1..] {
+                    merged = merge_flow_states(&merged, arm_f);
                 }
-                *presence = merged;
+                *flow = merged;
             }
         }
         Statement::Unmodeled(u) => {
@@ -547,9 +599,9 @@ fn word_as_literal(word: &Word) -> Option<&str> {
 }
 
 /// Extract test refinements from an if-condition.
-/// Recognizes `[[ -n "$x" ]]` → x is Set in then-branch,
-/// `[[ -z "$x" ]]` → x is Unset in then-branch.
-fn extract_test_refinements(condition: &[Statement]) -> Vec<(String, Presence)> {
+/// Recognizes presence refinements (-n → Set, -z → Unset) and
+/// path refinements (-f → ExistingFile, -d → ExistingDir, -e → ExistingPath).
+fn extract_test_refinements(condition: &[Statement]) -> Vec<TestRefinement> {
     let mut refinements = Vec::new();
     for stmt in condition {
         if let Statement::Command(cmd) = stmt
@@ -564,8 +616,31 @@ fn extract_test_refinements(condition: &[Statement]) -> Vec<(String, Presence)> 
             let var_name = cmd.args.get(1).and_then(extract_single_var_name);
             if let (Some(flag), Some(name)) = (flag, var_name) {
                 match flag {
-                    "-n" => refinements.push((name, Presence::Set)),
-                    "-z" => refinements.push((name, Presence::Unset)),
+                    "-n" => refinements.push(TestRefinement {
+                        var_name: name,
+                        presence: Presence::Set,
+                        type_refinement: None,
+                    }),
+                    "-z" => refinements.push(TestRefinement {
+                        var_name: name,
+                        presence: Presence::Unset,
+                        type_refinement: None,
+                    }),
+                    "-f" => refinements.push(TestRefinement {
+                        var_name: name,
+                        presence: Presence::Set,
+                        type_refinement: Some("ExistingFile".into()),
+                    }),
+                    "-d" => refinements.push(TestRefinement {
+                        var_name: name,
+                        presence: Presence::Set,
+                        type_refinement: Some("ExistingDir".into()),
+                    }),
+                    "-e" => refinements.push(TestRefinement {
+                        var_name: name,
+                        presence: Presence::Set,
+                        type_refinement: Some("ExistingPath".into()),
+                    }),
                     _ => {}
                 }
             }
@@ -593,18 +668,18 @@ fn extract_single_var_name(word: &Word) -> Option<String> {
     None
 }
 
-/// Handle list elements with presence tracking, including `|| return`/`|| exit` patterns.
-fn check_list_presence(
+/// Handle list elements with flow tracking, including `|| return`/`|| exit` patterns.
+fn check_list_flow(
     list: &List,
     source_id: SourceId,
     symbols: &SymbolTable,
     scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
-    presence: &mut PresenceMap,
+    flow: &mut FlowState,
     sigs: &FunctionSigs,
 ) {
     for (i, elem) in list.elements.iter().enumerate() {
-        check_statement(&elem.statement, source_id, symbols, scope, diagnostics, presence, sigs);
+        check_statement(&elem.statement, source_id, symbols, scope, diagnostics, flow, sigs);
 
         // After `cmd || return/exit`, the left-side's refinements carry forward
         // because if cmd failed, we'd have returned/exited
@@ -617,8 +692,11 @@ fn check_list_presence(
                 && is_test_command(cmd)
             {
                 let refinements = extract_test_refinements(std::slice::from_ref(&elem.statement));
-                for (name, p) in refinements {
-                    presence.insert(name, p);
+                for r in refinements {
+                    flow.presence.insert(r.var_name.clone(), r.presence);
+                    if let Some(ref type_ref) = r.type_refinement {
+                        flow.refinements.entry(r.var_name).or_default().insert(type_ref.clone());
+                    }
                 }
             }
         }
@@ -634,13 +712,14 @@ fn is_exit_or_return(stmt: &Statement) -> bool {
     }
 }
 
-/// BT102: Check function call site against #@sig contract.
+/// BT102/BT401: Check function call site against #@sig contract.
 fn check_call_site(
     cmd: &Command,
     source_id: SourceId,
     symbols: &SymbolTable,
     scope: ScopeId,
     sigs: &FunctionSigs,
+    flow: &FlowState,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let func_name = match command_name_str(cmd) {
@@ -755,6 +834,66 @@ fn check_call_site(
             }
             _ => {}
         }
+
+        // BT401: check refinement requirements
+        if let Some(required_refinement) = type_expr_inner_refinement(&param.type_expr)
+            && is_path_refinement(&required_refinement)
+            && let Some(var_name) = extract_single_var_name(arg)
+        {
+            let has_proof = flow
+                .refinements
+                .get(&var_name)
+                .is_some_and(|refs| refs.contains(&required_refinement));
+            if !has_proof {
+                let guard_flag = match required_refinement.as_str() {
+                    "ExistingFile" => "-f",
+                    "ExistingDir" => "-d",
+                    "ExistingPath" => "-e",
+                    _ => "-e",
+                };
+                diagnostics.push(
+                    Diagnostic::warning(
+                        BT401,
+                        format!(
+                            "argument '{}' to '{}' requires {} but no proof found",
+                            param.name, func_name, required_refinement,
+                        ),
+                        source_id,
+                        arg.span,
+                    )
+                    .with_help(format!(
+                        "guard with `[[ {} \"${}\" ]] || return 1` before the call",
+                        guard_flag, var_name
+                    ))
+                    .with_agent_context(format!(
+                        "Parameter '{}' is declared as {} which requires a runtime proof. \
+                         Use a test guard like `[[ {} \"${}\" ]]` before calling '{}' \
+                         so the checker can verify the path exists.",
+                        param.name,
+                        format_type_expr(&param.type_expr),
+                        guard_flag,
+                        var_name,
+                        func_name,
+                    )),
+                );
+            }
+        }
+    }
+}
+
+fn is_path_refinement(name: &str) -> bool {
+    matches!(name, "ExistingFile" | "ExistingDir" | "ExistingPath")
+}
+
+/// Extract the inner refinement name from a type expression.
+/// e.g., Scalar[ExistingFile] → Some("ExistingFile"), Scalar → None
+fn type_expr_inner_refinement(type_expr: &TypeExpr) -> Option<String> {
+    match type_expr {
+        TypeExpr::Parameterized { param, .. } => match param.as_ref() {
+            TypeExpr::Named(name) => Some(name.clone()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1690,5 +1829,111 @@ deploy \"${arr[@]}\"";
         let diagnostics = check_src(src);
         let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
         assert!(bt302s.is_empty(), "case with default and all arms assigning: var should be Set");
+    }
+
+    // Path refinement tests (BT401)
+
+    #[test]
+    fn bt401_no_proof_fires() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        assert_eq!(bt401s.len(), 1, "calling with unproven ExistingFile should fire BT401");
+        assert!(bt401s[0].message.contains("ExistingFile"));
+    }
+
+    #[test]
+    fn bt401_with_f_guard_no_fire() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+if [[ -f \"$cfg\" ]]; then
+  deploy \"$cfg\"
+fi";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        assert!(bt401s.is_empty(), "ExistingFile proof via [[ -f ]] should suppress BT401");
+    }
+
+    #[test]
+    fn bt401_with_or_return_guard_no_fire() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+[[ -f \"$cfg\" ]] || return 1
+deploy \"$cfg\"";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        assert!(bt401s.is_empty(), "ExistingFile proof via || return should suppress BT401");
+    }
+
+    #[test]
+    fn bt401_wrong_refinement_fires() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+if [[ -d \"$cfg\" ]]; then
+  deploy \"$cfg\"
+fi";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        assert_eq!(bt401s.len(), 1, "-d proves ExistingDir, not ExistingFile");
+    }
+
+    #[test]
+    fn bt401_d_guard_for_existing_dir() {
+        let src = "\
+#@sig scan(dir: Scalar[ExistingDir]) -> Status[0]
+scan() { echo done; }
+d=/tmp/out
+if [[ -d \"$d\" ]]; then
+  scan \"$d\"
+fi";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        assert!(bt401s.is_empty(), "-d proof should satisfy ExistingDir");
+    }
+
+    #[test]
+    fn bt401_no_fire_for_non_path_refinement() {
+        let src = "\
+#@sig greet(name: Scalar[String]) -> Status[0]
+greet() { echo done; }
+n=world
+greet \"$n\"";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        assert!(bt401s.is_empty(), "String is not a path refinement — no BT401");
+    }
+
+    #[test]
+    fn bt401_refinement_lost_after_reassignment() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() { echo done; }
+cfg=/etc/config
+if [[ -f \"$cfg\" ]]; then
+  cfg=/other/path
+  deploy \"$cfg\"
+fi";
+        let diagnostics = check_src(src);
+        let bt401s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT401).collect();
+        assert_eq!(bt401s.len(), 1, "reassignment should invalidate ExistingFile proof");
+    }
+
+    #[test]
+    fn path_refinement_f_sets_presence() {
+        // [[ -f "$x" ]] proves x is Set in the then-branch
+        let src = "foo() {\n  local x\n  if [[ -f \"$x\" ]]; then\n    echo \"$x\"\n  fi\n}";
+        let diagnostics = check_src(src);
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert!(bt302s.is_empty(), "-f test should prove variable is Set in then-branch");
     }
 }
