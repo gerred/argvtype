@@ -21,6 +21,118 @@ pub enum CommandEffect {
     MayExit,
 }
 
+/// Bitflags for efficient effect set operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct EffectSet(u16);
+
+impl EffectSet {
+    pub const NONE: EffectSet = EffectSet(0);
+    pub const READS_FS: EffectSet = EffectSet(1 << 0);
+    pub const WRITES_FS: EffectSet = EffectSet(1 << 1);
+    pub const CHANGES_CWD: EffectSet = EffectSet(1 << 2);
+    pub const MAY_EXEC: EffectSet = EffectSet(1 << 3);
+    pub const NETWORK: EffectSet = EffectSet(1 << 4);
+    pub const MUTATES_ENV: EffectSet = EffectSet(1 << 5);
+    pub const MAY_EXIT: EffectSet = EffectSet(1 << 6);
+    pub const MAY_SOURCE: EffectSet = EffectSet(1 << 7);
+    pub const MAY_SPLIT: EffectSet = EffectSet(1 << 8);
+    pub const MAY_GLOB: EffectSet = EffectSet(1 << 9);
+
+    /// Conservative default for unknown external commands.
+    pub const UNKNOWN_EXTERNAL: EffectSet = EffectSet(
+        Self::MAY_EXEC.0 | Self::READS_FS.0 | Self::WRITES_FS.0,
+    );
+
+    pub const fn contains(self, other: EffectSet) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn union(self, other: EffectSet) -> EffectSet {
+        EffectSet(self.0 | other.0)
+    }
+
+    pub const fn intersects(self, other: EffectSet) -> bool {
+        (self.0 & other.0) != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns true if this effect set could invalidate path proofs
+    /// (writes_fs, changes_cwd, may_exec with unknown effects, may_source).
+    pub const fn invalidates_path_proofs(self) -> bool {
+        self.intersects(EffectSet(
+            Self::WRITES_FS.0 | Self::CHANGES_CWD.0 | Self::MAY_SOURCE.0,
+        ))
+    }
+
+    /// Convert from a CommandEffect enum variant.
+    pub const fn from_command_effect(effect: CommandEffect) -> EffectSet {
+        match effect {
+            CommandEffect::ReadsFs => Self::READS_FS,
+            CommandEffect::WritesFs => Self::WRITES_FS,
+            CommandEffect::ChangesCwd => Self::CHANGES_CWD,
+            CommandEffect::MayExec => Self::MAY_EXEC,
+            CommandEffect::Network => Self::NETWORK,
+            CommandEffect::MutatesEnv => Self::MUTATES_ENV,
+            CommandEffect::MayExit => Self::MAY_EXIT,
+        }
+    }
+
+    /// Convert from a `#@sig` effect name string.
+    pub fn from_effect_name(name: &str) -> Option<EffectSet> {
+        match name {
+            "reads_fs" => Some(Self::READS_FS),
+            "writes_fs" => Some(Self::WRITES_FS),
+            "changes_cwd" => Some(Self::CHANGES_CWD),
+            "may_exec" => Some(Self::MAY_EXEC),
+            "network" => Some(Self::NETWORK),
+            "mutates_env" => Some(Self::MUTATES_ENV),
+            "may_exit" => Some(Self::MAY_EXIT),
+            "may_source" => Some(Self::MAY_SOURCE),
+            "may_split" => Some(Self::MAY_SPLIT),
+            "may_glob" => Some(Self::MAY_GLOB),
+            _ => None,
+        }
+    }
+}
+
+/// Compute the EffectSet for a known command from its CommandSig.
+pub fn command_effects(sig: &CommandSig) -> EffectSet {
+    let mut set = EffectSet::NONE;
+    for &effect in sig.effects {
+        set = set.union(EffectSet::from_command_effect(effect));
+    }
+    set
+}
+
+/// Look up the EffectSet for a command by name.
+/// Returns UNKNOWN_EXTERNAL for unknown commands, NONE for builtins without effects.
+pub fn lookup_effects(name: &str) -> EffectSet {
+    // Builtins with known effects
+    match name {
+        "cd" => EffectSet::CHANGES_CWD,
+        "source" | "." => EffectSet::MAY_SOURCE.union(EffectSet::MAY_EXEC),
+        "eval" => EffectSet::MAY_EXEC.union(EffectSet::MAY_SOURCE),
+        "exec" => EffectSet::MAY_EXEC.union(EffectSet::MAY_EXIT),
+        "exit" | "return" => EffectSet::MAY_EXIT,
+        "export" | "unset" | "declare" | "local" | "readonly" => EffectSet::MUTATES_ENV,
+        // Safe builtins
+        "echo" | "printf" | "true" | "false" | ":" | "test" | "[" | "[[" => EffectSet::NONE,
+        "read" | "mapfile" | "readarray" => EffectSet::MUTATES_ENV,
+        "shift" | "set" => EffectSet::MUTATES_ENV,
+        _ => {
+            // Check the command library
+            if let Some(sig) = lookup_command(name) {
+                command_effects(sig)
+            } else {
+                EffectSet::UNKNOWN_EXTERNAL
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct KnownFlag {
     pub short: Option<&'static str>,
@@ -216,5 +328,83 @@ mod tests {
     fn lookup_kubectl() {
         let cmd = lookup_command("kubectl").expect("kubectl should be known");
         assert_eq!(cmd.destructiveness, Destructiveness::SystemAltering);
+    }
+
+    // EffectSet tests
+
+    #[test]
+    fn effect_set_empty() {
+        assert!(EffectSet::NONE.is_empty());
+        assert!(!EffectSet::READS_FS.is_empty());
+    }
+
+    #[test]
+    fn effect_set_union() {
+        let set = EffectSet::READS_FS.union(EffectSet::WRITES_FS);
+        assert!(set.contains(EffectSet::READS_FS));
+        assert!(set.contains(EffectSet::WRITES_FS));
+        assert!(!set.contains(EffectSet::MAY_EXEC));
+    }
+
+    #[test]
+    fn effect_set_intersects() {
+        let set = EffectSet::READS_FS.union(EffectSet::WRITES_FS);
+        assert!(set.intersects(EffectSet::READS_FS));
+        assert!(!set.intersects(EffectSet::MAY_EXEC));
+    }
+
+    #[test]
+    fn effect_set_invalidates_path_proofs() {
+        assert!(EffectSet::WRITES_FS.invalidates_path_proofs());
+        assert!(EffectSet::CHANGES_CWD.invalidates_path_proofs());
+        assert!(EffectSet::MAY_SOURCE.invalidates_path_proofs());
+        assert!(!EffectSet::READS_FS.invalidates_path_proofs());
+        assert!(!EffectSet::MAY_EXEC.invalidates_path_proofs());
+    }
+
+    #[test]
+    fn effect_set_from_name() {
+        assert_eq!(EffectSet::from_effect_name("reads_fs"), Some(EffectSet::READS_FS));
+        assert_eq!(EffectSet::from_effect_name("may_exec"), Some(EffectSet::MAY_EXEC));
+        assert_eq!(EffectSet::from_effect_name("unknown_thing"), None);
+    }
+
+    #[test]
+    fn lookup_effects_cd() {
+        let effects = lookup_effects("cd");
+        assert!(effects.contains(EffectSet::CHANGES_CWD));
+    }
+
+    #[test]
+    fn lookup_effects_echo() {
+        let effects = lookup_effects("echo");
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn lookup_effects_rm() {
+        let effects = lookup_effects("rm");
+        assert!(effects.contains(EffectSet::WRITES_FS));
+    }
+
+    #[test]
+    fn lookup_effects_unknown() {
+        let effects = lookup_effects("some_random_tool");
+        assert_eq!(effects, EffectSet::UNKNOWN_EXTERNAL);
+        assert!(effects.contains(EffectSet::MAY_EXEC));
+    }
+
+    #[test]
+    fn lookup_effects_source() {
+        let effects = lookup_effects("source");
+        assert!(effects.contains(EffectSet::MAY_SOURCE));
+    }
+
+    #[test]
+    fn command_effects_from_sig() {
+        let sig = lookup_command("rm").unwrap();
+        let effects = command_effects(sig);
+        assert!(effects.contains(EffectSet::WRITES_FS));
+        assert!(!effects.contains(EffectSet::READS_FS));
     }
 }
