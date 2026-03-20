@@ -192,7 +192,7 @@ pub struct ParamExpand {
     pub operand: Option<Box<Word>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub enum ParamOperator {
     Default,

@@ -14,6 +14,16 @@ pub enum CellKind {
     Unknown,
 }
 
+/// Whether a variable is known to be set at a given program point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum Presence {
+    Set,
+    Unset,
+    MaybeUnset,
+    Unknown,
+}
+
 /// The expansion shape of a variable — how it behaves when expanded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
@@ -29,6 +39,7 @@ pub struct TypeInfo {
     pub cell_kind: CellKind,
     pub shape: ExpansionShape,
     pub refinement: Option<String>,
+    pub presence: Presence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -168,7 +179,7 @@ pub fn build_symbol_table(source_unit: &SourceUnit) -> SymbolTable {
             && let Some(sym) = table.scopes[global.0 as usize].symbols.get_mut(&td.name)
         {
             sym.type_annotation = Some(td.type_expr.clone());
-            sym.type_info = infer_type_info(sym.cell_kind, Some(&td.type_expr));
+            sym.type_info = infer_type_info(sym.cell_kind, Some(&td.type_expr), sym.type_info.presence);
         }
     }
 
@@ -185,7 +196,7 @@ fn build_function(table: &mut SymbolTable, func: &Function, parent: ScopeId) {
             Directive::Sig(sig) => {
                 for param in &sig.params {
                     let cell_kind = type_expr_to_cell_kind(&param.type_expr);
-                    let type_info = infer_type_info(cell_kind, Some(&param.type_expr));
+                    let type_info = infer_type_info(cell_kind, Some(&param.type_expr), Presence::MaybeUnset);
                     table.define(
                         func_scope,
                         Symbol {
@@ -208,7 +219,7 @@ fn build_function(table: &mut SymbolTable, func: &Function, parent: ScopeId) {
                     } else {
                         CellKind::Scalar
                     };
-                    let type_info = infer_type_info(cell_kind, None);
+                    let type_info = infer_type_info(cell_kind, None, Presence::MaybeUnset);
                     table.define(
                         func_scope,
                         Symbol {
@@ -229,7 +240,7 @@ fn build_function(table: &mut SymbolTable, func: &Function, parent: ScopeId) {
                     .get_mut(&td.name)
                 {
                     sym.type_annotation = Some(td.type_expr.clone());
-                    sym.type_info = infer_type_info(sym.cell_kind, Some(&td.type_expr));
+                    sym.type_info = infer_type_info(sym.cell_kind, Some(&td.type_expr), sym.type_info.presence);
                 }
             }
             _ => {}
@@ -247,7 +258,13 @@ fn build_statement(table: &mut SymbolTable, stmt: &Statement, scope: ScopeId) {
             table.bind_node(a.id, scope);
             let cell_kind = cell_kind_from_assignment(a);
             let decl_scope = decl_scope_from_assignment(a);
-            let type_info = infer_type_info(cell_kind, None);
+            let has_value = a.value.is_some() || a.array_value.is_some();
+            let presence = if has_value {
+                Presence::Set
+            } else {
+                Presence::Unset
+            };
+            let type_info = infer_type_info(cell_kind, None, presence);
             table.define(
                 scope,
                 Symbol {
@@ -292,7 +309,7 @@ fn build_statement(table: &mut SymbolTable, stmt: &Statement, scope: ScopeId) {
                 Symbol {
                     name: for_loop.variable.clone(),
                     cell_kind: CellKind::Scalar,
-                    type_info: infer_type_info(CellKind::Scalar, None),
+                    type_info: infer_type_info(CellKind::Scalar, None, Presence::Set),
                     decl_scope: DeclScope::Implicit,
                     decl_span: for_loop.span,
                     decl_node: for_loop.id,
@@ -368,7 +385,7 @@ fn decl_scope_from_assignment(a: &Assignment) -> DeclScope {
     }
 }
 
-fn infer_type_info(cell_kind: CellKind, type_annotation: Option<&TypeExpr>) -> TypeInfo {
+fn infer_type_info(cell_kind: CellKind, type_annotation: Option<&TypeExpr>, presence: Presence) -> TypeInfo {
     match type_annotation {
         Some(type_expr) => {
             let (shape, refinement) = match type_expr {
@@ -390,7 +407,7 @@ fn infer_type_info(cell_kind: CellKind, type_annotation: Option<&TypeExpr>) -> T
                 TypeExpr::Status(_) => (ExpansionShape::Scalar, Some("Status".into())),
                 _ => (ExpansionShape::Unknown, None),
             };
-            TypeInfo { cell_kind, shape, refinement }
+            TypeInfo { cell_kind, shape, refinement, presence }
         }
         None => {
             let shape = match cell_kind {
@@ -399,7 +416,7 @@ fn infer_type_info(cell_kind: CellKind, type_annotation: Option<&TypeExpr>) -> T
                 CellKind::Scalar => ExpansionShape::Scalar,
                 CellKind::Unknown => ExpansionShape::Unknown,
             };
-            TypeInfo { cell_kind, shape, refinement: None }
+            TypeInfo { cell_kind, shape, refinement: None, presence }
         }
     }
 }
@@ -641,7 +658,7 @@ process() {
     fn type_info_shape_unknown() {
         let mut table = SymbolTable::new();
         let root = table.root_scope();
-        let ti = super::infer_type_info(CellKind::Unknown, None);
+        let ti = super::infer_type_info(CellKind::Unknown, None, super::Presence::Unknown);
         assert_eq!(ti.shape, ExpansionShape::Unknown);
         table.define(root, Symbol {
             name: "mystery".into(),
@@ -654,5 +671,49 @@ process() {
         });
         let sym = table.resolve(root, "mystery").unwrap();
         assert_eq!(sym.type_info.shape, ExpansionShape::Unknown);
+    }
+
+    #[test]
+    fn presence_set_from_assignment() {
+        let table = build("x=hello");
+        let sym = table.resolve(table.root_scope(), "x").unwrap();
+        assert_eq!(sym.type_info.presence, Presence::Set);
+    }
+
+    #[test]
+    fn presence_unset_from_local_no_value() {
+        let table = build("foo() { local x; }");
+        let func_scope = ScopeId(1);
+        let sym = table.resolve(func_scope, "x").unwrap();
+        assert_eq!(sym.type_info.presence, Presence::Unset);
+    }
+
+    #[test]
+    fn presence_set_from_local_with_value() {
+        let table = build("foo() { local x=hello; }");
+        let func_scope = ScopeId(1);
+        let sym = table.resolve(func_scope, "x").unwrap();
+        assert_eq!(sym.type_info.presence, Presence::Set);
+    }
+
+    #[test]
+    fn presence_set_for_loop_var() {
+        let table = build("for f in *.txt; do echo \"$f\"; done");
+        let sym = table.resolve(table.root_scope(), "f").unwrap();
+        assert_eq!(sym.type_info.presence, Presence::Set);
+    }
+
+    #[test]
+    fn presence_maybe_unset_for_sig_param() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0] !may_exec
+deploy() {
+  #@bind $1 cfg
+  echo done
+}";
+        let table = build(src);
+        let func_scope = ScopeId(1);
+        let sym = table.resolve(func_scope, "cfg").unwrap();
+        assert_eq!(sym.type_info.presence, Presence::MaybeUnset);
     }
 }

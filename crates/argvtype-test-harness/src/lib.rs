@@ -108,4 +108,33 @@ mod tests {
             result.diagnostics
         );
     }
+
+    #[test]
+    fn presence_unset_produces_bt302() {
+        let result = check_fixture("../../fixtures/presence_unset.sh");
+        assert!(
+            result.diagnostics.iter().any(|d| d.code.number == 302),
+            "expected BT302 diagnostic for unset variable use"
+        );
+    }
+
+    #[test]
+    fn presence_guarded_no_bt302() {
+        let result = check_fixture("../../fixtures/presence_guarded.sh");
+        let bt302s: Vec<_> = result.diagnostics.iter().filter(|d| d.code.number == 302).collect();
+        assert!(
+            bt302s.is_empty(),
+            "expected no BT302 for guarded variables, got: {:?}",
+            bt302s.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn presence_undeclared_produces_bt301() {
+        let result = check_fixture("../../fixtures/presence_undeclared.sh");
+        assert!(
+            result.diagnostics.iter().any(|d| d.code.number == 301),
+            "expected BT301 diagnostic for undeclared variable"
+        );
+    }
 }
