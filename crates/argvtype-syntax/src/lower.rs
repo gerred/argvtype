@@ -16,10 +16,18 @@ pub struct LowerResult {
     pub parse_errors: Vec<ParseError>,
     pub annotation_errors: Vec<AnnotationError>,
     pub lowering_errors: Vec<LoweringError>,
+    source_text: String,
+}
+
+impl LowerResult {
+    pub fn source_text(&self) -> &str {
+        &self.source_text
+    }
 }
 
 pub fn parse_and_lower(source: SourceFile) -> LowerResult {
     let (annotations, annotation_errors) = annotation::parse_annotations(&source);
+    let saved_source_text = source.source.clone();
 
     let mut session = ParseSession::new();
     let parsed = match session.parse(source) {
@@ -34,6 +42,7 @@ pub fn parse_and_lower(source: SourceFile) -> LowerResult {
                 parse_errors: vec![e],
                 annotation_errors,
                 lowering_errors: Vec::new(),
+                source_text: saved_source_text,
             };
         }
     };
@@ -51,6 +60,7 @@ pub fn parse_and_lower(source: SourceFile) -> LowerResult {
         parse_errors,
         annotation_errors,
         lowering_errors: ctx.errors,
+        source_text: saved_source_text,
     }
 }
 
@@ -689,21 +699,34 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn lower_list(&mut self, node: &tree_sitter::Node) -> Statement {
-        // A list is like `cmd1 && cmd2` or `cmd1 || cmd2`
-        // For M0, treat as a block of statements
         let id = self.alloc_id();
         let span = self.node_span(node);
-        let mut body = Vec::new();
+        let mut elements: Vec<ListElement> = Vec::new();
+        let mut pending_op: Option<ListOperator> = None;
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             match child.kind() {
-                "&&" | "||" | ";" | "\n" => {}
-                _ => body.push(self.lower_statement(&child)),
+                "&&" => pending_op = Some(ListOperator::And),
+                "||" => pending_op = Some(ListOperator::Or),
+                ";" => pending_op = Some(ListOperator::Semi),
+                "\n" => {}
+                _ => {
+                    // Attach pending operator to previous element
+                    if let Some(op) = pending_op.take()
+                        && let Some(last) = elements.last_mut()
+                    {
+                        last.operator = Some(op);
+                    }
+                    elements.push(ListElement {
+                        statement: self.lower_statement(&child),
+                        operator: None,
+                    });
+                }
             }
         }
 
-        Statement::Block(Block { id, span, body })
+        Statement::List(List { id, span, elements })
     }
 
     fn lower_redirected_statement(&mut self, node: &tree_sitter::Node) -> Statement {

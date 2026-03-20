@@ -3,25 +3,23 @@ use argvtype_core::diagnostic::render_diagnostics;
 use argvtype_syntax::lower::parse_and_lower;
 use argvtype_syntax::span::{SourceFile, SourceId};
 
-pub fn run(paths: &[String], format: &str, dump_hir: bool) -> i32 {
-    if paths.is_empty() {
-        eprintln!("error: no files specified");
+pub fn run(
+    paths: &[String],
+    format: &str,
+    dump_hir: bool,
+    command: Option<&str>,
+    stdin: bool,
+) -> i32 {
+    let sources = collect_sources(paths, command, stdin);
+    if sources.is_empty() {
+        eprintln!("error: no input specified (use paths, --command, or --stdin)");
         return 1;
     }
 
     let mut has_errors = false;
 
-    for (idx, path) in paths.iter().enumerate() {
-        let source_text = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: cannot read '{}': {}", path, e);
-                has_errors = true;
-                continue;
-            }
-        };
-
-        let source = SourceFile::new(SourceId(idx as u32), path.clone(), source_text);
+    for source in sources {
+        let name = source.name.clone();
         let result = parse_and_lower(source);
 
         if dump_hir {
@@ -33,7 +31,7 @@ pub fn run(paths: &[String], format: &str, dump_hir: bool) -> i32 {
                     );
                 }
                 _ => {
-                    println!("--- HIR for {} ---", path);
+                    println!("--- HIR for {} ---", name);
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&result.source_unit).unwrap()
@@ -43,26 +41,27 @@ pub fn run(paths: &[String], format: &str, dump_hir: bool) -> i32 {
         }
 
         for err in &result.parse_errors {
-            eprintln!("{}: parse error: {}", path, err);
+            eprintln!("{}: parse error: {}", name, err);
             has_errors = true;
         }
 
         for err in &result.annotation_errors {
-            eprintln!("{}: annotation error: {}", path, err);
+            eprintln!("{}: annotation error: {}", name, err);
             has_errors = true;
         }
 
         for err in &result.lowering_errors {
-            eprintln!("{}: lowering warning: {}", path, err);
+            eprintln!("{}: lowering warning: {}", name, err);
         }
 
         let diagnostics = check(&result.source_unit);
 
         if !diagnostics.is_empty() {
-            // Re-read source for rendering (we need it for miette)
-            let source_text = std::fs::read_to_string(path).unwrap();
-            let render_source =
-                SourceFile::new(SourceId(idx as u32), path.clone(), source_text);
+            let render_source = SourceFile::new(
+                result.source_unit.source_id,
+                name.clone(),
+                result.source_text().to_string(),
+            );
 
             match format {
                 "json" => {
@@ -86,4 +85,52 @@ pub fn run(paths: &[String], format: &str, dump_hir: bool) -> i32 {
     }
 
     if has_errors { 1 } else { 0 }
+}
+
+fn collect_sources(
+    paths: &[String],
+    command: Option<&str>,
+    stdin: bool,
+) -> Vec<SourceFile> {
+    let mut sources = Vec::new();
+    let mut next_id = 0u32;
+
+    if let Some(cmd) = command {
+        sources.push(SourceFile::new(
+            SourceId(next_id),
+            "<command>".to_string(),
+            cmd.to_string(),
+        ));
+        next_id += 1;
+    }
+
+    if stdin {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+            .expect("failed to read from stdin");
+        sources.push(SourceFile::new(
+            SourceId(next_id),
+            "<stdin>".to_string(),
+            input,
+        ));
+        next_id += 1;
+    }
+
+    for path in paths {
+        match std::fs::read_to_string(path) {
+            Ok(s) => {
+                sources.push(SourceFile::new(
+                    SourceId(next_id),
+                    path.clone(),
+                    s,
+                ));
+                next_id += 1;
+            }
+            Err(e) => {
+                eprintln!("error: cannot read '{}': {}", path, e);
+            }
+        }
+    }
+
+    sources
 }

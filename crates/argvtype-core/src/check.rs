@@ -98,6 +98,11 @@ fn check_statement_with_arrays(
                 check_statement_with_arrays(s, source_id, array_names, diagnostics);
             }
         }
+        Statement::List(list) => {
+            for elem in &list.elements {
+                check_statement_with_arrays(&elem.statement, source_id, array_names, diagnostics);
+            }
+        }
         Statement::Block(b) => {
             for s in &b.body {
                 check_statement_with_arrays(s, source_id, array_names, diagnostics);

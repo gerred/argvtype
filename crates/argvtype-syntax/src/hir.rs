@@ -38,6 +38,7 @@ pub enum Statement {
     For(ForLoop),
     While(WhileLoop),
     Case(CaseStatement),
+    List(List),
     Block(Block),
     Unmodeled(Unmodeled),
 }
@@ -126,6 +127,27 @@ pub struct CaseArm {
     pub span: Span,
     pub patterns: Vec<Word>,
     pub body: Vec<Statement>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct List {
+    pub id: NodeId,
+    pub span: Span,
+    pub elements: Vec<ListElement>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListElement {
+    pub statement: Statement,
+    pub operator: Option<ListOperator>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum ListOperator {
+    And,
+    Or,
+    Semi,
 }
 
 #[derive(Debug, Clone, Serialize)]

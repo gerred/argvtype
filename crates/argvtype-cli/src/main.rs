@@ -21,6 +21,12 @@ enum Commands {
         /// Dump HIR to stdout
         #[arg(long)]
         dump_hir: bool,
+        /// Check a command string directly
+        #[arg(long, short = 'c')]
+        command: Option<String>,
+        /// Read source from stdin
+        #[arg(long)]
+        stdin: bool,
     },
     /// Start the language server
     Lsp,
@@ -39,16 +45,16 @@ fn main() {
             paths,
             format,
             dump_hir,
-        } => commands::check::run(&paths, &format, dump_hir),
-        Commands::Lsp => {
-            match argvtype_lsp::run_server() {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    1
-                }
+            command,
+            stdin,
+        } => commands::check::run(&paths, &format, dump_hir, command.as_deref(), stdin),
+        Commands::Lsp => match argvtype_lsp::run_server() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
             }
-        }
+        },
         Commands::Explain { code } => {
             eprintln!("explain is not yet implemented for code: {}", code);
             1
