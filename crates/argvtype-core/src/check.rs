@@ -67,13 +67,18 @@ fn presence_join(a: Presence, b: Presence) -> Presence {
 }
 
 fn merge_presence_maps(a: &PresenceMap, b: &PresenceMap) -> PresenceMap {
-    let mut result = a.clone();
-    for (name, &b_presence) in b {
-        let merged = match result.get(name) {
-            Some(&a_presence) => presence_join(a_presence, b_presence),
-            None => b_presence,
+    let mut result = PresenceMap::new();
+    for (name, &a_presence) in a {
+        let merged = match b.get(name) {
+            Some(&b_presence) => presence_join(a_presence, b_presence),
+            None => presence_join(a_presence, Presence::Unknown),
         };
         result.insert(name.clone(), merged);
+    }
+    for (name, &b_presence) in b {
+        if !a.contains_key(name) {
+            result.insert(name.clone(), presence_join(Presence::Unknown, b_presence));
+        }
     }
     result
 }
@@ -232,17 +237,24 @@ fn check_statement(
             *presence = merge_presence_maps(&then_presence, &else_presence);
         }
         Statement::For(for_loop) => {
+            // Loop body may execute zero or more times — fork and merge
+            let pre_loop = presence.clone();
             for s in &for_loop.body {
                 check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
             }
+            *presence = merge_presence_maps(&pre_loop, presence);
         }
         Statement::While(while_loop) => {
+            // Condition always evaluates at least once
             for s in &while_loop.condition {
                 check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
             }
+            // Loop body may execute zero or more times — fork and merge
+            let pre_loop = presence.clone();
             for s in &while_loop.body {
                 check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
             }
+            *presence = merge_presence_maps(&pre_loop, presence);
         }
         Statement::List(list) => {
             check_list_presence(list, source_id, symbols, scope, diagnostics, presence, sigs);
@@ -264,10 +276,33 @@ fn check_statement(
             }
         }
         Statement::Case(case_stmt) => {
+            let pre_case = presence.clone();
+            let mut arm_presences: Vec<PresenceMap> = Vec::new();
             for arm in &case_stmt.arms {
+                let mut arm_presence = pre_case.clone();
                 for s in &arm.body {
-                    check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
+                    check_statement(s, source_id, symbols, scope, diagnostics, &mut arm_presence, sigs);
                 }
+                arm_presences.push(arm_presence);
+            }
+            // If no wildcard/default arm, case might not match — include pre-case state
+            let has_default = case_stmt.arms.iter().any(|arm| {
+                arm.patterns.iter().any(|p| {
+                    p.segments
+                        .first()
+                        .is_some_and(|s| matches!(s, WordSegment::Literal(l) if l == "*"))
+                })
+            });
+            if !has_default {
+                arm_presences.push(pre_case);
+            }
+            // Merge all arm presences
+            if let Some(first) = arm_presences.first().cloned() {
+                let mut merged = first;
+                for arm_p in &arm_presences[1..] {
+                    merged = merge_presence_maps(&merged, arm_p);
+                }
+                *presence = merged;
             }
         }
         Statement::Unmodeled(u) => {
@@ -1611,5 +1646,49 @@ deploy \"${arr[@]}\"";
         let diagnostics = check_src("foo() { local a; local b; read a b; echo \"$a\" \"$b\"; }");
         let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
         assert!(bt302s.is_empty(), "read should mark all variables as Set");
+    }
+
+    // Loop convergence tests
+
+    #[test]
+    fn for_loop_var_maybe_unset_after() {
+        let src = "foo() {\n  local result\n  for f in *.txt; do\n    result=\"found\"\n  done\n  echo \"$result\"\n}";
+        let diagnostics = check_src(src);
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert_eq!(bt302s.len(), 1, "var assigned only in for loop should be MaybeUnset after");
+    }
+
+    #[test]
+    fn for_loop_var_set_before_stays_set() {
+        let src = "foo() {\n  local result=default\n  for f in *.txt; do\n    result=\"found\"\n  done\n  echo \"$result\"\n}";
+        let diagnostics = check_src(src);
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert!(bt302s.is_empty(), "var Set before for loop and assigned in body should stay Set");
+    }
+
+    #[test]
+    fn while_loop_body_assignment_maybe_unset() {
+        let src = "foo() {\n  local x\n  while true; do\n    x=hello\n  done\n  echo \"$x\"\n}";
+        let diagnostics = check_src(src);
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert_eq!(bt302s.len(), 1, "var assigned only in while body should be MaybeUnset after");
+    }
+
+    // Case merging tests
+
+    #[test]
+    fn case_merging_without_default() {
+        let src = "foo() {\n  local x\n  case \"$1\" in\n    a) x=hello ;;\n    b) x=world ;;\n  esac\n  echo \"$x\"\n}";
+        let diagnostics = check_src(src);
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert_eq!(bt302s.len(), 1, "case without default: var should be MaybeUnset");
+    }
+
+    #[test]
+    fn case_merging_with_default() {
+        let src = "foo() {\n  local x\n  case \"$1\" in\n    a) x=hello ;;\n    *) x=default ;;\n  esac\n  echo \"$x\"\n}";
+        let diagnostics = check_src(src);
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert!(bt302s.is_empty(), "case with default and all arms assigning: var should be Set");
     }
 }

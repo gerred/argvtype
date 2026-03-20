@@ -256,27 +256,33 @@ fn build_statement(table: &mut SymbolTable, stmt: &Statement, scope: ScopeId) {
     match stmt {
         Statement::Assignment(a) => {
             table.bind_node(a.id, scope);
-            let cell_kind = cell_kind_from_assignment(a);
-            let decl_scope = decl_scope_from_assignment(a);
-            let has_value = a.value.is_some() || a.array_value.is_some();
-            let presence = if has_value {
-                Presence::Set
-            } else {
-                Presence::Unset
-            };
-            let type_info = infer_type_info(cell_kind, None, presence);
-            table.define(
-                scope,
-                Symbol {
-                    name: a.name.clone(),
-                    cell_kind,
-                    type_info,
-                    decl_scope,
-                    decl_span: a.span,
-                    decl_node: a.id,
-                    type_annotation: None,
-                },
-            );
+            // Only define the symbol if it's a declaration (local/declare/export/readonly)
+            // or if it doesn't already exist in this scope. Re-assignments are tracked
+            // by flow analysis in check.rs, not the static symbol table.
+            let is_declaration = a.decl_kind.is_some();
+            if is_declaration || !table.scope(scope).symbols.contains_key(&a.name) {
+                let cell_kind = cell_kind_from_assignment(a);
+                let decl_scope = decl_scope_from_assignment(a);
+                let has_value = a.value.is_some() || a.array_value.is_some();
+                let presence = if has_value {
+                    Presence::Set
+                } else {
+                    Presence::Unset
+                };
+                let type_info = infer_type_info(cell_kind, None, presence);
+                table.define(
+                    scope,
+                    Symbol {
+                        name: a.name.clone(),
+                        cell_kind,
+                        type_info,
+                        decl_scope,
+                        decl_span: a.span,
+                        decl_node: a.id,
+                        type_annotation: None,
+                    },
+                );
+            }
         }
         Statement::Command(cmd) => {
             table.bind_node(cmd.id, scope);
