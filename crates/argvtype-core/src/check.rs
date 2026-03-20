@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use argvtype_syntax::annotation::{Directive, SigDirective, TypeExpr};
 use argvtype_syntax::hir::*;
 use argvtype_syntax::span::SourceId;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Fix};
@@ -7,12 +8,16 @@ use crate::stdlib::{self, Destructiveness};
 
 const BT000: DiagnosticCode = DiagnosticCode { family: "BT", number: 0 };
 const BT101: DiagnosticCode = DiagnosticCode { family: "BT", number: 101 };
+const BT102: DiagnosticCode = DiagnosticCode { family: "BT", number: 102 };
 const BT201: DiagnosticCode = DiagnosticCode { family: "BT", number: 201 };
 const BT202: DiagnosticCode = DiagnosticCode { family: "BT", number: 202 };
+const BT203: DiagnosticCode = DiagnosticCode { family: "BT", number: 203 };
 const BT301: DiagnosticCode = DiagnosticCode { family: "BT", number: 301 };
 const BT302: DiagnosticCode = DiagnosticCode { family: "BT", number: 302 };
 const BT801: DiagnosticCode = DiagnosticCode { family: "BT", number: 801 };
 const BT802: DiagnosticCode = DiagnosticCode { family: "BT", number: 802 };
+
+type FunctionSigs = HashMap<String, SigDirective>;
 
 type PresenceMap = HashMap<String, Presence>;
 
@@ -73,8 +78,23 @@ fn merge_presence_maps(a: &PresenceMap, b: &PresenceMap) -> PresenceMap {
     result
 }
 
+fn collect_function_sigs(source_unit: &SourceUnit) -> FunctionSigs {
+    let mut sigs = FunctionSigs::new();
+    for item in &source_unit.items {
+        if let Item::Function(f) = item {
+            for ann in &f.annotations {
+                if let Directive::Sig(sig) = &ann.directive {
+                    sigs.insert(f.name.clone(), sig.clone());
+                }
+            }
+        }
+    }
+    sigs
+}
+
 pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
     let symbols = scope::build_symbol_table(source_unit);
+    let sigs = collect_function_sigs(source_unit);
     let mut diagnostics = Vec::new();
     let source_id = source_unit.source_id;
     let root = symbols.root_scope();
@@ -85,10 +105,10 @@ pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
             Item::Function(f) => {
                 let scope = symbols.scope_of_node(f.id).unwrap_or(root);
                 let mut func_presence = init_presence_map(&symbols, scope);
-                check_statements(&f.body, source_id, &symbols, scope, &mut diagnostics, &mut func_presence);
+                check_statements(&f.body, source_id, &symbols, scope, &mut diagnostics, &mut func_presence, &sigs);
             }
             Item::Statement(s) => {
-                check_statement(s, source_id, &symbols, root, &mut diagnostics, &mut global_presence);
+                check_statement(s, source_id, &symbols, root, &mut diagnostics, &mut global_presence, &sigs);
             }
             _ => {}
         }
@@ -110,16 +130,29 @@ fn check_statements(
     scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
     presence: &mut PresenceMap,
+    sigs: &FunctionSigs,
 ) {
     for stmt in stmts {
-        check_statement(stmt, source_id, symbols, scope, diagnostics, presence);
+        check_statement(stmt, source_id, symbols, scope, diagnostics, presence, sigs);
     }
 }
 
-fn is_array_in_scope(symbols: &SymbolTable, scope: ScopeId, name: &str) -> bool {
+fn is_argv_shape_in_scope(symbols: &SymbolTable, scope: ScopeId, name: &str) -> bool {
     symbols
         .resolve(scope, name)
-        .is_some_and(|sym| matches!(sym.type_info.cell_kind, CellKind::IndexedArray | CellKind::AssocArray))
+        .is_some_and(|sym| {
+            matches!(sym.type_info.cell_kind, CellKind::IndexedArray | CellKind::AssocArray)
+                || sym.type_info.shape == ExpansionShape::Argv
+        })
+}
+
+fn is_scalar_shape_in_scope(symbols: &SymbolTable, scope: ScopeId, name: &str) -> bool {
+    symbols
+        .resolve(scope, name)
+        .is_some_and(|sym| {
+            sym.type_info.shape == ExpansionShape::Scalar
+                && matches!(sym.type_info.cell_kind, CellKind::Scalar | CellKind::Unknown)
+        })
 }
 
 fn check_statement(
@@ -129,6 +162,7 @@ fn check_statement(
     scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
     presence: &mut PresenceMap,
+    sigs: &FunctionSigs,
 ) {
     match stmt {
         Statement::Assignment(a) => {
@@ -155,15 +189,19 @@ fn check_statement(
             }
             // Recognize `: "${x:?msg}"` guard pattern
             apply_colon_guard(cmd, presence);
+            // Track commands that modify variable presence
+            apply_command_presence_effects(cmd, presence);
+            // BT102: function call site checking against #@sig
+            check_call_site(cmd, source_id, symbols, scope, sigs, diagnostics);
         }
         Statement::Pipeline(p) => {
             for cmd in &p.commands {
-                check_statement(cmd, source_id, symbols, scope, diagnostics, presence);
+                check_statement(cmd, source_id, symbols, scope, diagnostics, presence, sigs);
             }
         }
         Statement::If(if_stmt) => {
             for s in &if_stmt.condition {
-                check_statement(s, source_id, symbols, scope, diagnostics, presence);
+                check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
             }
 
             // Extract test refinements from condition
@@ -174,7 +212,7 @@ fn check_statement(
             for (name, p) in &refinements {
                 then_presence.insert(name.clone(), *p);
             }
-            check_statements(&if_stmt.then_body, source_id, symbols, scope, diagnostics, &mut then_presence);
+            check_statements(&if_stmt.then_body, source_id, symbols, scope, diagnostics, &mut then_presence, sigs);
 
             // Fork presence for else-branch (inverted refinements)
             let mut else_presence = presence.clone();
@@ -187,7 +225,7 @@ fn check_statement(
                 else_presence.insert(name.clone(), inverted);
             }
             if let Some(else_body) = &if_stmt.else_body {
-                check_statements(else_body, source_id, symbols, scope, diagnostics, &mut else_presence);
+                check_statements(else_body, source_id, symbols, scope, diagnostics, &mut else_presence, sigs);
             }
 
             // Merge at join point
@@ -195,19 +233,19 @@ fn check_statement(
         }
         Statement::For(for_loop) => {
             for s in &for_loop.body {
-                check_statement(s, source_id, symbols, scope, diagnostics, presence);
+                check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
             }
         }
         Statement::While(while_loop) => {
             for s in &while_loop.condition {
-                check_statement(s, source_id, symbols, scope, diagnostics, presence);
+                check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
             }
             for s in &while_loop.body {
-                check_statement(s, source_id, symbols, scope, diagnostics, presence);
+                check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
             }
         }
         Statement::List(list) => {
-            check_list_presence(list, source_id, symbols, scope, diagnostics, presence);
+            check_list_presence(list, source_id, symbols, scope, diagnostics, presence, sigs);
             // BT802: cd followed by ; instead of && within a list
             check_list_for_cd_semi(list, source_id, diagnostics);
         }
@@ -222,13 +260,13 @@ fn check_statement(
                 block_scope
             };
             for s in &b.body {
-                check_statement(s, source_id, symbols, body_scope, diagnostics, presence);
+                check_statement(s, source_id, symbols, body_scope, diagnostics, presence, sigs);
             }
         }
         Statement::Case(case_stmt) => {
             for arm in &case_stmt.arms {
                 for s in &arm.body {
-                    check_statement(s, source_id, symbols, scope, diagnostics, presence);
+                    check_statement(s, source_id, symbols, scope, diagnostics, presence, sigs);
                 }
             }
         }
@@ -397,6 +435,82 @@ fn apply_colon_guard_segment(segment: &WordSegment, presence: &mut PresenceMap) 
     }
 }
 
+/// Track commands that modify variable presence:
+/// - `read var` / `read -r var` → Set
+/// - `unset var` → Unset
+/// - `mapfile var` / `readarray var` → Set
+/// - `printf -v var ...` → Set
+fn apply_command_presence_effects(cmd: &Command, presence: &mut PresenceMap) {
+    let name = match command_name_str(cmd) {
+        Some(n) => n,
+        None => return,
+    };
+    match name {
+        "read" => {
+            // `read [-r] [-d delim] [-n count] [-p prompt] [-t timeout] [-u fd] var [var...]`
+            // Variable names are the non-flag arguments at the end
+            for arg in cmd.args.iter().rev() {
+                if let Some(var_name) = word_as_literal(arg) {
+                    if var_name.starts_with('-') {
+                        break;
+                    }
+                    presence.insert(var_name.to_string(), Presence::Set);
+                } else {
+                    break;
+                }
+            }
+        }
+        "unset" => {
+            // `unset [-fv] var [var...]`
+            for arg in &cmd.args {
+                if let Some(var_name) = word_as_literal(arg) {
+                    if var_name.starts_with('-') {
+                        continue;
+                    }
+                    presence.insert(var_name.to_string(), Presence::Unset);
+                }
+            }
+        }
+        "mapfile" | "readarray" => {
+            // `mapfile [-t] [-n count] [-O origin] [-s count] [-C callback] [-c quantum] [array]`
+            // The array name is the last non-flag argument, or defaults to MAPFILE
+            if let Some(last) = cmd.args.last()
+                && let Some(var_name) = word_as_literal(last)
+                && !var_name.starts_with('-')
+            {
+                presence.insert(var_name.to_string(), Presence::Set);
+            }
+        }
+        "printf" => {
+            // `printf -v var format [args...]` — assigns to var
+            let mut i = 0;
+            while i < cmd.args.len() {
+                if let Some(flag) = word_as_literal(&cmd.args[i])
+                    && flag == "-v"
+                {
+                    if let Some(next) = cmd.args.get(i + 1)
+                        && let Some(var_name) = word_as_literal(next)
+                    {
+                        presence.insert(var_name.to_string(), Presence::Set);
+                    }
+                    break;
+                }
+                i += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn word_as_literal(word: &Word) -> Option<&str> {
+    if word.segments.len() == 1
+        && let WordSegment::Literal(s) = &word.segments[0]
+    {
+        return Some(s.as_str());
+    }
+    None
+}
+
 /// Extract test refinements from an if-condition.
 /// Recognizes `[[ -n "$x" ]]` → x is Set in then-branch,
 /// `[[ -z "$x" ]]` → x is Unset in then-branch.
@@ -452,9 +566,10 @@ fn check_list_presence(
     scope: ScopeId,
     diagnostics: &mut Vec<Diagnostic>,
     presence: &mut PresenceMap,
+    sigs: &FunctionSigs,
 ) {
     for (i, elem) in list.elements.iter().enumerate() {
-        check_statement(&elem.statement, source_id, symbols, scope, diagnostics, presence);
+        check_statement(&elem.statement, source_id, symbols, scope, diagnostics, presence, sigs);
 
         // After `cmd || return/exit`, the left-side's refinements carry forward
         // because if cmd failed, we'd have returned/exited
@@ -484,6 +599,187 @@ fn is_exit_or_return(stmt: &Statement) -> bool {
     }
 }
 
+/// BT102: Check function call site against #@sig contract.
+fn check_call_site(
+    cmd: &Command,
+    source_id: SourceId,
+    symbols: &SymbolTable,
+    scope: ScopeId,
+    sigs: &FunctionSigs,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let func_name = match command_name_str(cmd) {
+        Some(n) => n,
+        None => return,
+    };
+    let sig = match sigs.get(func_name) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let has_variadic = sig.params.iter().any(|p| {
+        matches!(&p.type_expr, TypeExpr::Named(n) if n == "Argv")
+            || matches!(&p.type_expr, TypeExpr::Parameterized { name, .. } if name == "Argv")
+    });
+
+    // Check argument count
+    let expected = sig.params.len();
+    let actual = cmd.args.len();
+    if !has_variadic && actual != expected {
+        diagnostics.push(
+            Diagnostic::error(
+                BT102,
+                format!(
+                    "function '{}' expects {} argument{} but got {}",
+                    func_name,
+                    expected,
+                    if expected == 1 { "" } else { "s" },
+                    actual,
+                ),
+                source_id,
+                cmd.span,
+            )
+            .with_help(format!(
+                "signature: {}({})",
+                func_name,
+                sig.params.iter().map(|p| format!("{}: {}", p.name, format_type_expr(&p.type_expr))).collect::<Vec<_>>().join(", ")
+            )),
+        );
+    } else if has_variadic && actual < expected.saturating_sub(1) {
+        // Variadic: need at least the non-variadic params
+        let required = expected - 1;
+        diagnostics.push(
+            Diagnostic::error(
+                BT102,
+                format!(
+                    "function '{}' expects at least {} argument{} but got {}",
+                    func_name,
+                    required,
+                    if required == 1 { "" } else { "s" },
+                    actual,
+                ),
+                source_id,
+                cmd.span,
+            )
+            .with_help(format!(
+                "signature: {}({})",
+                func_name,
+                sig.params.iter().map(|p| format!("{}: {}", p.name, format_type_expr(&p.type_expr))).collect::<Vec<_>>().join(", ")
+            )),
+        );
+    }
+
+    // Check expansion shape of each argument against the declared param type
+    for (i, param) in sig.params.iter().enumerate() {
+        if i >= cmd.args.len() {
+            break;
+        }
+        let arg = &cmd.args[i];
+        let param_shape = type_expr_shape(&param.type_expr);
+
+        match param_shape {
+            ExpansionShape::Scalar => {
+                // Param expects scalar — check if arg is an array expansion
+                if word_is_array_expansion(arg) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            BT102,
+                            format!(
+                                "argument '{}' to '{}' expects Scalar but got array expansion",
+                                param.name, func_name,
+                            ),
+                            source_id,
+                            arg.span,
+                        )
+                        .with_help(format!(
+                            "parameter '{}' is declared as {} — pass a single value, not an array",
+                            param.name, format_type_expr(&param.type_expr)
+                        )),
+                    );
+                }
+            }
+            ExpansionShape::Argv => {
+                // Param expects argv — check if arg is a bare scalar (not array expansion)
+                if word_is_bare_scalar_expansion(arg, symbols, scope) {
+                    diagnostics.push(
+                        Diagnostic::warning(
+                            BT102,
+                            format!(
+                                "argument '{}' to '{}' expects Argv but got scalar expansion",
+                                param.name, func_name,
+                            ),
+                            source_id,
+                            arg.span,
+                        )
+                        .with_help(format!(
+                            "parameter '{}' is declared as {} — consider passing an array expansion like \"${{arr[@]}}\"",
+                            param.name, format_type_expr(&param.type_expr)
+                        )),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn type_expr_shape(type_expr: &TypeExpr) -> ExpansionShape {
+    match type_expr {
+        TypeExpr::Named(name) if name == "Scalar" => ExpansionShape::Scalar,
+        TypeExpr::Named(name) if name == "Argv" => ExpansionShape::Argv,
+        TypeExpr::Parameterized { name, .. } if name == "Scalar" => ExpansionShape::Scalar,
+        TypeExpr::Parameterized { name, .. } if name == "Argv" => ExpansionShape::Argv,
+        _ => ExpansionShape::Scalar, // default: scalar
+    }
+}
+
+fn format_type_expr(type_expr: &TypeExpr) -> String {
+    match type_expr {
+        TypeExpr::Named(name) => name.clone(),
+        TypeExpr::Parameterized { name, param } => format!("{}[{}]", name, format_type_expr(param)),
+        TypeExpr::Status(code) => format!("Status[{}]", code),
+        _ => "Unknown".into(),
+    }
+}
+
+fn word_is_array_expansion(word: &Word) -> bool {
+    word.segments.iter().any(|seg| matches!(seg, WordSegment::ArrayExpand(_)))
+        || word.segments.iter().any(|seg| {
+            if let WordSegment::DoubleQuoted(inner) = seg {
+                inner.iter().any(|s| matches!(s, WordSegment::ArrayExpand(_)))
+            } else {
+                false
+            }
+        })
+}
+
+fn word_is_bare_scalar_expansion(word: &Word, symbols: &SymbolTable, scope: ScopeId) -> bool {
+    for seg in &word.segments {
+        match seg {
+            WordSegment::ParamExpand(pe) if pe.operator.is_none() => {
+                if let Some(sym) = symbols.resolve(scope, &pe.name)
+                    && sym.type_info.shape == ExpansionShape::Scalar
+                {
+                    return true;
+                }
+            }
+            WordSegment::DoubleQuoted(inner) => {
+                for s in inner {
+                    if let WordSegment::ParamExpand(pe) = s
+                        && pe.operator.is_none()
+                        && let Some(sym) = symbols.resolve(scope, &pe.name)
+                        && sym.type_info.shape == ExpansionShape::Scalar
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn check_word_for_bare_array(
     word: &Word,
     source_id: SourceId,
@@ -506,7 +802,7 @@ fn check_segment_for_bare_array(
     match segment {
         WordSegment::ParamExpand(pe) => {
             // Bare $arr where arr is a declared array
-            if pe.operator.is_none() && is_array_in_scope(symbols, scope, &pe.name) {
+            if pe.operator.is_none() && is_argv_shape_in_scope(symbols, scope, &pe.name) {
                 diagnostics.push(
                     Diagnostic::error(
                         BT201,
@@ -525,6 +821,26 @@ fn check_segment_for_bare_array(
                         description: "Expand as array".into(),
                         replacement: Some(format!("\"${{{}[@]}}\"", pe.name)),
                     }),
+                );
+            }
+        }
+        WordSegment::ArrayExpand(ae) => {
+            // ${var[@]} or ${var[*]} where var is a scalar — BT203
+            if is_scalar_shape_in_scope(symbols, scope, &ae.name) {
+                diagnostics.push(
+                    Diagnostic::error(
+                        BT203,
+                        format!(
+                            "scalar '{}' used in array expansion — variable is not an array",
+                            ae.name
+                        ),
+                        source_id,
+                        ae.span,
+                    )
+                    .with_help(format!(
+                        "use \"${}\" for scalar expansion, or declare '{}' as an array",
+                        ae.name, ae.name
+                    )),
                 );
             }
         }
@@ -1132,5 +1448,168 @@ declare -a x=(1 2 3)";
         let diagnostics = check_src("foo() { local x; x=hello; echo \"$x\"; }");
         let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
         assert!(bt302s.is_empty());
+    }
+
+    // Command-aware presence effect tests
+
+    // BT203 tests: scalar used in array expansion
+
+    #[test]
+    fn bt203_scalar_array_expand() {
+        let diagnostics = check_src("x=hello\necho \"${x[@]}\"");
+        let bt203s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT203).collect();
+        assert_eq!(bt203s.len(), 1);
+        assert!(bt203s[0].message.contains("scalar"));
+    }
+
+    #[test]
+    fn bt203_no_fire_on_array() {
+        let diagnostics = check_src("declare -a arr=(1 2 3)\necho \"${arr[@]}\"");
+        let bt203s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT203).collect();
+        assert!(bt203s.is_empty());
+    }
+
+    #[test]
+    fn bt203_no_fire_on_unknown() {
+        // Unknown variables should not trigger BT203
+        let diagnostics = check_src("echo \"${unknown_var[@]}\"");
+        let bt203s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT203).collect();
+        assert!(bt203s.is_empty());
+    }
+
+    #[test]
+    fn bt201_annotation_argv_bare_expand() {
+        // Variable annotated as Argv but expanded as bare $var — should trigger BT201
+        let src = "\
+#@type files: Argv[String]
+declare -a files=(a b c)
+echo $files";
+        let diagnostics = check_src(src);
+        let bt201s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT201).collect();
+        assert_eq!(bt201s.len(), 1);
+    }
+
+    // BT102 tests: function call site checking
+
+    #[test]
+    fn bt102_wrong_arg_count() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile], env: Scalar[String]) -> Status[0]
+deploy() {
+  echo done
+}
+deploy one_arg";
+        let diagnostics = check_src(src);
+        let bt102s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT102).collect();
+        assert_eq!(bt102s.len(), 1);
+        assert!(bt102s[0].message.contains("expects 2 arguments but got 1"));
+    }
+
+    #[test]
+    fn bt102_correct_arg_count_no_fire() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile], env: Scalar[String]) -> Status[0]
+deploy() {
+  echo done
+}
+deploy config.yaml production";
+        let diagnostics = check_src(src);
+        let bt102s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT102).collect();
+        assert!(bt102s.is_empty());
+    }
+
+    #[test]
+    fn bt102_too_many_args() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() {
+  echo done
+}
+deploy config.yaml extra_arg";
+        let diagnostics = check_src(src);
+        let bt102s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT102).collect();
+        assert_eq!(bt102s.len(), 1);
+        assert!(bt102s[0].message.contains("expects 1 argument but got 2"));
+    }
+
+    #[test]
+    fn bt102_variadic_allows_extra() {
+        let src = "\
+#@sig process(dir: Scalar[ExistingDir], files: Argv[String]) -> Status[0]
+process() {
+  echo done
+}
+process /tmp a.txt b.txt c.txt";
+        let diagnostics = check_src(src);
+        let bt102s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT102).collect();
+        assert!(bt102s.is_empty());
+    }
+
+    #[test]
+    fn bt102_no_sig_no_fire() {
+        // Function without #@sig should not trigger BT102
+        let src = "deploy() { echo done; }\ndeploy a b c";
+        let diagnostics = check_src(src);
+        let bt102s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT102).collect();
+        assert!(bt102s.is_empty());
+    }
+
+    #[test]
+    fn bt102_array_expansion_for_scalar_param() {
+        let src = "\
+#@sig deploy(cfg: Scalar[ExistingFile]) -> Status[0]
+deploy() {
+  echo done
+}
+declare -a arr=(a b)
+deploy \"${arr[@]}\"";
+        let diagnostics = check_src(src);
+        let bt102s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT102).collect();
+        assert_eq!(bt102s.len(), 1);
+        assert!(bt102s[0].message.contains("expects Scalar but got array expansion"));
+    }
+
+    // Command-aware presence effect tests
+
+    #[test]
+    fn read_sets_variable() {
+        let diagnostics = check_src("foo() { local x; read x; echo \"$x\"; }");
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert!(bt302s.is_empty(), "read should mark variable as Set");
+    }
+
+    #[test]
+    fn read_r_sets_variable() {
+        let diagnostics = check_src("foo() { local line; read -r line; echo \"$line\"; }");
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert!(bt302s.is_empty(), "read -r should mark variable as Set");
+    }
+
+    #[test]
+    fn unset_makes_variable_unset() {
+        let diagnostics = check_src("x=hello\nunset x\necho \"$x\"");
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert_eq!(bt302s.len(), 1, "unset should mark variable as Unset");
+    }
+
+    #[test]
+    fn mapfile_sets_variable() {
+        let diagnostics = check_src("foo() { local lines; mapfile lines; echo \"$lines\"; }");
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert!(bt302s.is_empty(), "mapfile should mark variable as Set");
+    }
+
+    #[test]
+    fn printf_v_sets_variable() {
+        let diagnostics = check_src("foo() { local out; printf -v out '%s' hello; echo \"$out\"; }");
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert!(bt302s.is_empty(), "printf -v should mark variable as Set");
+    }
+
+    #[test]
+    fn read_multiple_vars_sets_all() {
+        let diagnostics = check_src("foo() { local a; local b; read a b; echo \"$a\" \"$b\"; }");
+        let bt302s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT302).collect();
+        assert!(bt302s.is_empty(), "read should mark all variables as Set");
     }
 }

@@ -248,6 +248,7 @@ impl<'a> LoweringContext<'a> {
             "redirected_statement" => self.lower_redirected_statement(node),
             "negated_command" => self.lower_negated_command(node),
             "test_command" => self.lower_test_command(node),
+            "unset_command" => self.lower_unset_command(node),
             kind => {
                 let id = self.alloc_id();
                 let span = self.node_span(node);
@@ -809,6 +810,32 @@ impl<'a> LoweringContext<'a> {
             id,
             span,
             name: name_word,
+            args,
+            redirects: Vec::new(),
+        })
+    }
+
+    fn lower_unset_command(&mut self, node: &tree_sitter::Node) -> Statement {
+        // `unset [-fv] var [var...]` — lower as a Command with name "unset"
+        let id = self.alloc_id();
+        let span = self.node_span(node);
+        let mut args = Vec::new();
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "unset" => {}
+                _ => args.push(self.lower_word(&child)),
+            }
+        }
+
+        Statement::Command(Command {
+            id,
+            span,
+            name: Word {
+                span,
+                segments: vec![WordSegment::Literal("unset".to_string())],
+            },
             args,
             redirects: Vec::new(),
         })
