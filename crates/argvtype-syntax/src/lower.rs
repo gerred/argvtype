@@ -298,6 +298,20 @@ impl<'a> LoweringContext<'a> {
             segments: vec![WordSegment::Literal(self.node_text(node).to_string())],
         });
 
+        // Detect source/. commands and emit SourceCommand
+        if let Some(cmd_name) = name.literal_str()
+            && (cmd_name == "source" || cmd_name == ".") && !args.is_empty()
+        {
+            let path = args.remove(0);
+            let dynamic = path.has_expansions();
+            return Statement::SourceCommand(SourceCommand {
+                id,
+                span,
+                path,
+                dynamic,
+            });
+        }
+
         Statement::Command(Command {
             id,
             span,
@@ -1267,6 +1281,44 @@ deploy() {
                 assert!(a.array_value.is_some());
             }
             other => panic!("expected Assignment, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lower_source_command() {
+        let result = lower("source lib/utils.sh");
+        assert!(result.lowering_errors.is_empty());
+        match &result.source_unit.items[0] {
+            Item::Statement(Statement::SourceCommand(src)) => {
+                assert!(!src.dynamic);
+                assert_eq!(src.path.literal_str(), Some("lib/utils.sh"));
+            }
+            other => panic!("expected SourceCommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lower_dot_source_command() {
+        let result = lower(". /etc/profile");
+        assert!(result.lowering_errors.is_empty());
+        match &result.source_unit.items[0] {
+            Item::Statement(Statement::SourceCommand(src)) => {
+                assert!(!src.dynamic);
+                assert_eq!(src.path.literal_str(), Some("/etc/profile"));
+            }
+            other => panic!("expected SourceCommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lower_dynamic_source() {
+        let result = lower(r#"source "$CONFIG_DIR/lib.sh""#);
+        assert!(result.lowering_errors.is_empty());
+        match &result.source_unit.items[0] {
+            Item::Statement(Statement::SourceCommand(src)) => {
+                assert!(src.dynamic, "source with expansion should be marked dynamic");
+            }
+            other => panic!("expected SourceCommand, got {:?}", other),
         }
     }
 

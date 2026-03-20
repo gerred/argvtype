@@ -302,7 +302,25 @@ struct CheckCtx<'a> {
 }
 
 pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
-    let symbols = scope::build_symbol_table(source_unit);
+    check_with_imports(source_unit, &[])
+}
+
+/// Check a source unit with imported symbols from sourced files.
+/// Imported symbols are added to the root scope before checking.
+pub fn check_with_imports(
+    source_unit: &SourceUnit,
+    imported: &[&scope::Symbol],
+) -> Vec<Diagnostic> {
+    let mut symbols = scope::build_symbol_table(source_unit);
+
+    // Inject imported symbols into the root scope
+    let root = symbols.root_scope();
+    for &sym in imported {
+        if symbols.resolve(root, &sym.name).is_none() {
+            symbols.define(root, sym.clone());
+        }
+    }
+
     let sigs = collect_function_sigs(source_unit);
     let proves = collect_function_proves(source_unit);
     let ctx = CheckCtx {
@@ -312,7 +330,6 @@ pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
         proves: &proves,
     };
     let mut diagnostics = Vec::new();
-    let root = symbols.root_scope();
     let mut global_flow = FlowState::new(init_presence_map(&symbols, root));
 
     for item in &source_unit.items {
@@ -526,6 +543,29 @@ fn check_statement(
                 *flow = merged;
             }
         }
+        Statement::SourceCommand(src_cmd) => {
+            // Source commands are checked by the source graph layer.
+            // At the single-file level, conservatively invalidate all path proofs
+            // since sourced code may have arbitrary effects.
+            if !src_cmd.dynamic {
+                // Static source: BT701 (unresolved) is emitted by source_graph module
+            }
+            // Invalidate proofs: source may execute arbitrary code
+            let vars: Vec<String> = flow.refinements.keys().cloned().collect();
+            for var in vars {
+                if let Some(refs) = flow.refinements.remove(&var) {
+                    for refinement in refs {
+                        flow.invalidated.entry(var.clone()).or_default().push(
+                            InvalidatedProof {
+                                refinement,
+                                cause: InvalidationCause::Source,
+                                cause_span: src_cmd.span,
+                            },
+                        );
+                    }
+                }
+            }
+        }
         Statement::Unmodeled(u) => {
             diagnostics.push(
                 Diagnostic::warning(
@@ -545,6 +585,7 @@ fn stmt_node_id(stmt: &Statement) -> Option<NodeId> {
     match stmt {
         Statement::Assignment(a) => Some(a.id),
         Statement::Command(c) => Some(c.id),
+        Statement::SourceCommand(s) => Some(s.id),
         Statement::Pipeline(p) => Some(p.id),
         Statement::If(i) => Some(i.id),
         Statement::For(f) => Some(f.id),

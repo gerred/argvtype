@@ -159,6 +159,11 @@ impl SymbolTable {
             }
         }
     }
+
+    /// Returns an iterator over symbols in the global (root) scope.
+    pub fn global_symbols(&self) -> impl Iterator<Item = &Symbol> {
+        self.scopes[0].symbols.values()
+    }
 }
 
 pub fn build_symbol_table(source_unit: &SourceUnit) -> SymbolTable {
@@ -286,6 +291,9 @@ fn build_statement(table: &mut SymbolTable, stmt: &Statement, scope: ScopeId) {
         }
         Statement::Command(cmd) => {
             table.bind_node(cmd.id, scope);
+        }
+        Statement::SourceCommand(src) => {
+            table.bind_node(src.id, scope);
         }
         Statement::Pipeline(p) => {
             table.bind_node(p.id, scope);

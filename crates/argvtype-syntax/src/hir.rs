@@ -33,6 +33,7 @@ pub struct Function {
 pub enum Statement {
     Assignment(Assignment),
     Command(Command),
+    SourceCommand(SourceCommand),
     Pipeline(Pipeline),
     If(IfStatement),
     For(ForLoop),
@@ -70,6 +71,14 @@ pub struct Command {
     pub name: Word,
     pub args: Vec<Word>,
     pub redirects: Vec<Redirect>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCommand {
+    pub id: NodeId,
+    pub span: Span,
+    pub path: Word,
+    pub dynamic: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -182,6 +191,46 @@ pub enum WordSegment {
     CommandSub(CommandSub),
     ArithExpand(ArithExpand),
     ArrayExpand(ArrayExpand),
+}
+
+impl Word {
+    /// Returns the literal string value if this word is a single literal or single-quoted segment.
+    pub fn literal_str(&self) -> Option<&str> {
+        if self.segments.len() == 1 {
+            match &self.segments[0] {
+                WordSegment::Literal(s) => Some(s),
+                WordSegment::SingleQuoted(s) => Some(s),
+                WordSegment::DoubleQuoted(inner) if inner.len() == 1 => {
+                    if let WordSegment::Literal(s) = &inner[0] {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if this word contains any shell expansions (variables, command subs, etc.).
+    pub fn has_expansions(&self) -> bool {
+        self.segments.iter().any(|seg| seg.has_expansions())
+    }
+}
+
+impl WordSegment {
+    fn has_expansions(&self) -> bool {
+        match self {
+            WordSegment::Literal(_) | WordSegment::SingleQuoted(_) => false,
+            WordSegment::DoubleQuoted(inner) => inner.iter().any(|s| s.has_expansions()),
+            WordSegment::ParamExpand(_)
+            | WordSegment::CommandSub(_)
+            | WordSegment::ArithExpand(_)
+            | WordSegment::ArrayExpand(_) => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

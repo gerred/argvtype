@@ -118,6 +118,10 @@ impl CfgBuilder {
                 self.add_node(current, cmd.id);
                 current
             }
+            Statement::SourceCommand(src) => {
+                self.add_node(current, src.id);
+                current
+            }
             Statement::Pipeline(p) => {
                 self.add_node(current, p.id);
                 current
