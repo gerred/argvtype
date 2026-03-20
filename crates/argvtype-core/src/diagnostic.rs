@@ -25,6 +25,12 @@ pub enum Severity {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct Fix {
+    pub description: String,
+    pub replacement: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Label {
     pub span: Span,
     pub message: String,
@@ -39,6 +45,8 @@ pub struct Diagnostic {
     pub primary_span: Span,
     pub labels: Vec<Label>,
     pub help: Option<String>,
+    pub fix: Option<Fix>,
+    pub agent_context: Option<String>,
 }
 
 impl Diagnostic {
@@ -51,6 +59,8 @@ impl Diagnostic {
             primary_span: span,
             labels: Vec::new(),
             help: None,
+            fix: None,
+            agent_context: None,
         }
     }
 
@@ -63,6 +73,8 @@ impl Diagnostic {
             primary_span: span,
             labels: Vec::new(),
             help: None,
+            fix: None,
+            agent_context: None,
         }
     }
 
@@ -76,6 +88,16 @@ impl Diagnostic {
 
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help = Some(help.into());
+        self
+    }
+
+    pub fn with_fix(mut self, fix: Fix) -> Self {
+        self.fix = Some(fix);
+        self
+    }
+
+    pub fn with_agent_context(mut self, context: impl Into<String>) -> Self {
+        self.agent_context = Some(context.into());
         self
     }
 }
@@ -130,6 +152,27 @@ mod tests {
             number: 0,
         };
         assert_eq!(code2.to_string(), "BT000");
+    }
+
+    #[test]
+    fn builder_with_fix_and_agent_context() {
+        let diag = Diagnostic::error(
+            DiagnosticCode { family: "BT", number: 202 },
+            "unquoted expansion",
+            SourceId(0),
+            Span::new(0, 5),
+        )
+        .with_fix(Fix {
+            description: "Quote the variable".into(),
+            replacement: Some("\"$x\"".into()),
+        })
+        .with_agent_context("Unquoted expansions undergo word splitting.");
+
+        assert!(diag.fix.is_some());
+        let fix = diag.fix.unwrap();
+        assert_eq!(fix.description, "Quote the variable");
+        assert_eq!(fix.replacement.unwrap(), "\"$x\"");
+        assert_eq!(diag.agent_context.unwrap(), "Unquoted expansions undergo word splitting.");
     }
 
     #[test]

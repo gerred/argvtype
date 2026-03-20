@@ -13,4 +13,5 @@ argvtype-syntax = { workspace = true }
 argvtype-lsp = { workspace = true }
 clap = { workspace = true }
 miette = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }

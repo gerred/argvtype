@@ -1,9 +1,10 @@
 use argvtype_syntax::hir::*;
 use argvtype_syntax::span::SourceId;
-use crate::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::diagnostic::{Diagnostic, DiagnosticCode, Fix};
 
 const BT000: DiagnosticCode = DiagnosticCode { family: "BT", number: 0 };
 const BT201: DiagnosticCode = DiagnosticCode { family: "BT", number: 201 };
+const BT202: DiagnosticCode = DiagnosticCode { family: "BT", number: 202 };
 
 pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -66,6 +67,12 @@ fn check_statement_with_arrays(
             for arg in &cmd.args {
                 check_word_for_bare_array(arg, source_id, array_names, diagnostics);
             }
+            // BT202: unquoted expansion in command args
+            if !is_test_command(cmd) {
+                for arg in &cmd.args {
+                    check_word_for_unquoted_expansion(arg, source_id, diagnostics);
+                }
+            }
         }
         Statement::Pipeline(p) => {
             for cmd in &p.commands {
@@ -106,6 +113,13 @@ fn check_statement_with_arrays(
         Statement::Block(b) => {
             for s in &b.body {
                 check_statement_with_arrays(s, source_id, array_names, diagnostics);
+            }
+        }
+        Statement::Case(case_stmt) => {
+            for arm in &case_stmt.arms {
+                for s in &arm.body {
+                    check_statement_with_arrays(s, source_id, array_names, diagnostics);
+                }
             }
         }
         Statement::Unmodeled(u) => {
@@ -157,13 +171,74 @@ fn check_segment_for_bare_array(
                     .with_help(format!(
                         "use \"${{{}[@]}}\" to expand all elements",
                         pe.name
-                    )),
+                    ))
+                    .with_fix(Fix {
+                        description: "Expand as array".into(),
+                        replacement: Some(format!("\"${{{}[@]}}\"", pe.name)),
+                    }),
                 );
             }
         }
         WordSegment::DoubleQuoted(inner) => {
             for seg in inner {
                 check_segment_for_bare_array(seg, source_id, array_names, diagnostics);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_test_command(cmd: &Command) -> bool {
+    cmd.name.segments.first().is_some_and(|seg| {
+        matches!(seg, WordSegment::Literal(s) if s == "[[" || s == "[" || s == "test")
+    })
+}
+
+fn is_special_var(name: &str) -> bool {
+    matches!(name, "?" | "#" | "$" | "!" | "-" | "0")
+}
+
+fn check_word_for_unquoted_expansion(
+    word: &Word,
+    source_id: SourceId,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for segment in &word.segments {
+        check_segment_for_unquoted_expansion(segment, source_id, diagnostics, false);
+    }
+}
+
+fn check_segment_for_unquoted_expansion(
+    segment: &WordSegment,
+    source_id: SourceId,
+    diagnostics: &mut Vec<Diagnostic>,
+    quoted: bool,
+) {
+    match segment {
+        WordSegment::ParamExpand(pe) => {
+            if !quoted && pe.operator.is_none() && !is_special_var(&pe.name) {
+                diagnostics.push(
+                    Diagnostic::warning(
+                        BT202,
+                        format!("unquoted expansion '${}' may undergo word splitting and globbing", pe.name),
+                        source_id,
+                        pe.span,
+                    )
+                    .with_help(format!("wrap in double quotes: \"${}\"", pe.name))
+                    .with_fix(Fix {
+                        description: "Quote the variable".into(),
+                        replacement: Some(format!("\"${}\"", pe.name)),
+                    })
+                    .with_agent_context(
+                        "Unquoted variable expansions undergo word splitting and pathname expansion. \
+                         If the variable contains spaces or glob characters, this will produce unexpected arguments."
+                    ),
+                );
+            }
+        }
+        WordSegment::DoubleQuoted(inner) => {
+            for seg in inner {
+                check_segment_for_unquoted_expansion(seg, source_id, diagnostics, true);
             }
         }
         _ => {}
@@ -198,7 +273,74 @@ mod tests {
 
     #[test]
     fn clean_code_no_diagnostics() {
-        let diagnostics = check_src("x=hello\necho $x");
+        let diagnostics = check_src("x=hello\necho \"$x\"");
         assert!(diagnostics.is_empty());
+    }
+
+    // BT202 tests
+
+    #[test]
+    fn unquoted_expansion_detected() {
+        let diagnostics = check_src("x=hello\necho $x");
+        let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
+        assert_eq!(bt202s.len(), 1);
+        assert!(bt202s[0].message.contains("unquoted expansion"));
+    }
+
+    #[test]
+    fn quoted_expansion_ok() {
+        let diagnostics = check_src("x=hello\necho \"$x\"");
+        let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
+        assert!(bt202s.is_empty());
+    }
+
+    #[test]
+    fn assignment_rhs_no_bt202() {
+        let diagnostics = check_src("x=hello\ny=$x");
+        let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
+        assert!(bt202s.is_empty());
+    }
+
+    #[test]
+    fn for_items_no_bt202() {
+        let diagnostics = check_src("x=hello\nfor f in $x; do echo \"$f\"; done");
+        let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
+        assert!(bt202s.is_empty());
+    }
+
+    #[test]
+    fn test_command_no_bt202() {
+        let diagnostics = check_src("x=hello\n[[ -f $x ]]");
+        let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
+        assert!(bt202s.is_empty());
+    }
+
+    #[test]
+    fn special_var_no_bt202() {
+        let diagnostics = check_src("echo $?");
+        let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
+        assert!(bt202s.is_empty());
+    }
+
+    #[test]
+    fn multiple_unquoted_args() {
+        let diagnostics = check_src("a=x\nb=y\ncp $a $b");
+        let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
+        assert_eq!(bt202s.len(), 2);
+    }
+
+    #[test]
+    fn pipeline_unquoted() {
+        let diagnostics = check_src("x=hello\ny=world\necho $x | grep $y");
+        let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
+        assert_eq!(bt202s.len(), 2);
+    }
+
+    #[test]
+    fn bt202_has_fix() {
+        let diagnostics = check_src("x=hello\necho $x");
+        let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
+        assert!(bt202s[0].fix.is_some());
+        assert_eq!(bt202s[0].fix.as_ref().unwrap().description, "Quote the variable");
     }
 }

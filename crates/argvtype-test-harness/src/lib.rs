@@ -70,6 +70,18 @@ mod tests {
     }
 
     #[test]
+    fn unquoted_expansion_produces_diagnostic() {
+        let result = check_fixture("../../fixtures/unquoted_expansion.sh");
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.code.number == 202),
+            "expected BT202 diagnostic"
+        );
+    }
+
+    #[test]
     fn clean_produces_no_diagnostics() {
         let result = check_fixture("../../fixtures/clean.sh");
         assert!(

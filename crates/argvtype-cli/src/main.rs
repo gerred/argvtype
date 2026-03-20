@@ -27,6 +27,9 @@ enum Commands {
         /// Read source from stdin
         #[arg(long)]
         stdin: bool,
+        /// Output structured JSON for AI agent consumers
+        #[arg(long)]
+        agent: bool,
     },
     /// Start the language server
     Lsp,
@@ -47,7 +50,8 @@ fn main() {
             dump_hir,
             command,
             stdin,
-        } => commands::check::run(&paths, &format, dump_hir, command.as_deref(), stdin),
+            agent,
+        } => commands::check::run(&paths, &format, dump_hir, command.as_deref(), stdin, agent),
         Commands::Lsp => match argvtype_lsp::run_server() {
             Ok(()) => 0,
             Err(e) => {
