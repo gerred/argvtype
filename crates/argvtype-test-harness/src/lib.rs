@@ -70,6 +70,24 @@ mod tests {
     }
 
     #[test]
+    fn destructive_unquoted_produces_bt801() {
+        let result = check_fixture("../../fixtures/destructive_unquoted.sh");
+        assert!(
+            result.diagnostics.iter().any(|d| d.code.number == 801),
+            "expected BT801 diagnostic"
+        );
+    }
+
+    #[test]
+    fn cd_without_guard_produces_bt802() {
+        let result = check_fixture("../../fixtures/cd_without_guard.sh");
+        assert!(
+            result.diagnostics.iter().any(|d| d.code.number == 802),
+            "expected BT802 diagnostic"
+        );
+    }
+
+    #[test]
     fn unquoted_expansion_produces_diagnostic() {
         let result = check_fixture("../../fixtures/unquoted_expansion.sh");
         assert!(

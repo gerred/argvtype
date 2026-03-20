@@ -1,10 +1,13 @@
 use argvtype_syntax::hir::*;
 use argvtype_syntax::span::SourceId;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, Fix};
+use crate::stdlib::{self, Destructiveness};
 
 const BT000: DiagnosticCode = DiagnosticCode { family: "BT", number: 0 };
 const BT201: DiagnosticCode = DiagnosticCode { family: "BT", number: 201 };
 const BT202: DiagnosticCode = DiagnosticCode { family: "BT", number: 202 };
+const BT801: DiagnosticCode = DiagnosticCode { family: "BT", number: 801 };
+const BT802: DiagnosticCode = DiagnosticCode { family: "BT", number: 802 };
 
 pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -29,6 +32,9 @@ pub fn check(source_unit: &SourceUnit) -> Vec<Diagnostic> {
             _ => {}
         }
     }
+
+    // BT802: check consecutive top-level items for cd;next pattern
+    check_consecutive_cd_items(&source_unit.items, source_id, &mut diagnostics);
 
     diagnostics
 }
@@ -67,11 +73,13 @@ fn check_statement_with_arrays(
             for arg in &cmd.args {
                 check_word_for_bare_array(arg, source_id, array_names, diagnostics);
             }
-            // BT202: unquoted expansion in command args
             if !is_test_command(cmd) {
+                // BT202: unquoted expansion in command args
                 for arg in &cmd.args {
                     check_word_for_unquoted_expansion(arg, source_id, diagnostics);
                 }
+                // BT801: destructive command with unquoted variable
+                check_destructive_unquoted(cmd, source_id, diagnostics);
             }
         }
         Statement::Pipeline(p) => {
@@ -109,6 +117,8 @@ fn check_statement_with_arrays(
             for elem in &list.elements {
                 check_statement_with_arrays(&elem.statement, source_id, array_names, diagnostics);
             }
+            // BT802: cd followed by ; instead of && within a list
+            check_list_for_cd_semi(list, source_id, diagnostics);
         }
         Statement::Block(b) => {
             for s in &b.body {
@@ -245,6 +255,165 @@ fn check_segment_for_unquoted_expansion(
     }
 }
 
+fn command_name_str(cmd: &Command) -> Option<&str> {
+    cmd.name.segments.first().and_then(|seg| match seg {
+        WordSegment::Literal(s) => Some(s.as_str()),
+        _ => None,
+    })
+}
+
+fn word_has_unquoted_expansion(word: &Word) -> bool {
+    word.segments.iter().any(|seg| segment_has_unquoted_expansion(seg, false))
+}
+
+fn segment_has_unquoted_expansion(segment: &WordSegment, quoted: bool) -> bool {
+    match segment {
+        WordSegment::ParamExpand(pe) => {
+            !quoted && pe.operator.is_none() && !is_special_var(&pe.name)
+        }
+        WordSegment::DoubleQuoted(inner) => {
+            inner.iter().any(|seg| segment_has_unquoted_expansion(seg, true))
+        }
+        _ => false,
+    }
+}
+
+fn check_destructive_unquoted(
+    cmd: &Command,
+    source_id: SourceId,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let name = match command_name_str(cmd) {
+        Some(n) => n,
+        None => return,
+    };
+    let sig = match stdlib::lookup_command(name) {
+        Some(s) => s,
+        None => return,
+    };
+    if sig.destructiveness < Destructiveness::Destructive {
+        return;
+    }
+    for arg in &cmd.args {
+        if word_has_unquoted_expansion(arg) {
+            for seg in &arg.segments {
+                if let WordSegment::ParamExpand(pe) = seg
+                    && pe.operator.is_none()
+                    && !is_special_var(&pe.name)
+                {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            BT801,
+                            format!(
+                                "destructive command '{}' with unquoted variable '${}' — risk of unintended targets",
+                                name, pe.name
+                            ),
+                            source_id,
+                            cmd.span,
+                        )
+                        .with_label(pe.span, format!("unquoted '${}'", pe.name))
+                        .with_help(format!(
+                            "quote the variable: \"${}\" — or validate it before use",
+                            pe.name
+                        ))
+                        .with_fix(Fix {
+                            description: "Quote the variable".into(),
+                            replacement: Some(format!("\"${}\"", pe.name)),
+                        })
+                        .with_agent_context(format!(
+                            "'{}' is a {} command. An unquoted variable may expand to unexpected \
+                             filenames via word splitting or globbing, potentially destroying the wrong files.",
+                            name,
+                            match sig.destructiveness {
+                                Destructiveness::Destructive => "destructive",
+                                Destructiveness::SystemAltering => "system-altering",
+                                _ => "dangerous",
+                            }
+                        )),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn is_cd_command(stmt: &Statement) -> Option<&Command> {
+    match stmt {
+        Statement::Command(cmd) => {
+            if command_name_str(cmd) == Some("cd") {
+                Some(cmd)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn check_list_for_cd_semi(
+    list: &List,
+    source_id: SourceId,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (i, elem) in list.elements.iter().enumerate() {
+        if let Some(cd_cmd) = is_cd_command(&elem.statement)
+            && (elem.operator == Some(ListOperator::Semi)
+                || (elem.operator.is_none() && i + 1 < list.elements.len()))
+            && let Some(next) = list.elements.get(i + 1)
+        {
+            emit_bt802(cd_cmd, &next.statement, source_id, diagnostics);
+        }
+    }
+}
+
+fn check_consecutive_cd_items(
+    items: &[Item],
+    source_id: SourceId,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for window in items.windows(2) {
+        if let (Item::Statement(stmt_a), Item::Statement(stmt_b)) = (&window[0], &window[1])
+            && let Some(cd_cmd) = is_cd_command(stmt_a)
+        {
+            emit_bt802(cd_cmd, stmt_b, source_id, diagnostics);
+        }
+    }
+}
+
+fn emit_bt802(
+    cd_cmd: &Command,
+    next_stmt: &Statement,
+    source_id: SourceId,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let next_name = match next_stmt {
+        Statement::Command(cmd) => command_name_str(cmd).unwrap_or("..."),
+        Statement::Pipeline(_) => "pipeline",
+        _ => return,
+    };
+    diagnostics.push(
+        Diagnostic::error(
+            BT802,
+            format!(
+                "'cd' followed by '{}' without error check — if 'cd' fails, '{}' runs in the wrong directory",
+                next_name, next_name
+            ),
+            source_id,
+            cd_cmd.span,
+        )
+        .with_help("use 'cd /path && cmd' or 'cd /path || exit 1' to guard against cd failure")
+        .with_fix(Fix {
+            description: "Use && instead of ;".into(),
+            replacement: None,
+        })
+        .with_agent_context(
+            "If 'cd' fails (directory doesn't exist, no permission), the next command runs in the \
+             original directory. For destructive commands like 'rm', this can delete files in the wrong location. \
+             Use '&&' so the next command only runs if 'cd' succeeds."
+        ),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +511,100 @@ mod tests {
         let bt202s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT202).collect();
         assert!(bt202s[0].fix.is_some());
         assert_eq!(bt202s[0].fix.as_ref().unwrap().description, "Quote the variable");
+    }
+
+    // BT801 tests
+
+    #[test]
+    fn bt801_rm_unquoted() {
+        let diagnostics = check_src("f=test\nrm $f");
+        let bt801s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT801).collect();
+        assert_eq!(bt801s.len(), 1);
+        assert!(bt801s[0].message.contains("destructive command"));
+    }
+
+    #[test]
+    fn bt801_rm_quoted_ok() {
+        let diagnostics = check_src("f=test\nrm \"$f\"");
+        let bt801s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT801).collect();
+        assert!(bt801s.is_empty());
+    }
+
+    #[test]
+    fn bt801_mv_unquoted() {
+        let diagnostics = check_src("a=src\nb=dst\nmv $a $b");
+        let bt801s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT801).collect();
+        assert_eq!(bt801s.len(), 2);
+    }
+
+    #[test]
+    fn bt801_echo_no_trigger() {
+        let diagnostics = check_src("x=hello\necho $x");
+        let bt801s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT801).collect();
+        assert!(bt801s.is_empty());
+    }
+
+    #[test]
+    fn bt801_cp_no_trigger() {
+        // cp is Modifying, not Destructive
+        let diagnostics = check_src("f=test\ncp $f /tmp/");
+        let bt801s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT801).collect();
+        assert!(bt801s.is_empty());
+    }
+
+    #[test]
+    fn bt801_has_agent_context() {
+        let diagnostics = check_src("f=test\nrm $f");
+        let bt801s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT801).collect();
+        assert!(bt801s[0].agent_context.is_some());
+        assert!(bt801s[0].agent_context.as_ref().unwrap().contains("destructive"));
+    }
+
+    // BT802 tests
+
+    #[test]
+    fn bt802_cd_semi_rm() {
+        // tree-sitter splits top-level ; into separate items
+        let diagnostics = check_src("cd /tmp; rm file");
+        let bt802s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT802).collect();
+        assert_eq!(bt802s.len(), 1);
+        assert!(bt802s[0].message.contains("cd"));
+    }
+
+    #[test]
+    fn bt802_cd_and_ok() {
+        let diagnostics = check_src("cd /tmp && rm file");
+        let bt802s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT802).collect();
+        assert!(bt802s.is_empty());
+    }
+
+    #[test]
+    fn bt802_cd_or_exit_ok() {
+        let diagnostics = check_src("cd /tmp || exit 1");
+        let bt802s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT802).collect();
+        assert!(bt802s.is_empty());
+    }
+
+    #[test]
+    fn bt802_cd_newline_rm() {
+        // Consecutive top-level statements (newline separated)
+        let diagnostics = check_src("cd /tmp\nrm file");
+        let bt802s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT802).collect();
+        assert_eq!(bt802s.len(), 1);
+    }
+
+    #[test]
+    fn bt802_no_cd_no_trigger() {
+        let diagnostics = check_src("echo hello\nrm file");
+        let bt802s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT802).collect();
+        assert!(bt802s.is_empty());
+    }
+
+    #[test]
+    fn bt802_has_fix() {
+        let diagnostics = check_src("cd /tmp; rm file");
+        let bt802s: Vec<_> = diagnostics.iter().filter(|d| d.code == BT802).collect();
+        assert!(bt802s[0].fix.is_some());
+        assert_eq!(bt802s[0].fix.as_ref().unwrap().description, "Use && instead of ;");
     }
 }
